@@ -19,12 +19,14 @@ def str2bool(value: str | bool) -> bool:
 STAGES = [
     "prepare_data",
     "split",
+    "prepare_training_data",
     "tune_bm25",
     "build_bm25",
     "build_dense_index",
     "mine_hard_negatives",
     "sample_negatives",
     "train_bge",
+    "train_bge_retriever",
     "train_reranker",
     "retrieve_cache",
     "tune_hybrid",
@@ -59,6 +61,8 @@ class Config:
     bge_max_length: int
     bge_max_train_examples: int
     bge_use_amp: bool
+    bge_gradient_checkpointing: bool
+    bge_auto_batch_reduce: bool
     bge_negatives_per_example: int
     reranker_train_batch_size: int
     reranker_epochs: int
@@ -125,6 +129,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bge_max_length", type=int, default=512)
     parser.add_argument("--bge_max_train_examples", type=int, default=0)
     parser.add_argument("--bge_use_amp", type=str2bool, default=True)
+    parser.add_argument("--bge_gradient_checkpointing", type=str2bool, default=True)
+    parser.add_argument("--bge_auto_batch_reduce", type=str2bool, default=True)
     parser.add_argument("--bge_negatives_per_example", type=int, default=3)
     parser.add_argument("--reranker_train_batch_size", type=int, default=4)
     parser.add_argument("--reranker_epochs", type=int, default=1)
@@ -144,14 +150,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--alpha_grid", default="0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0")
     parser.add_argument("--router_model", default="ridge", choices=["ridge"])
     parser.add_argument("--top_k", type=int, default=100)
-    parser.add_argument("--candidate_top_k", type=int, default=100)
+    parser.add_argument("--candidate_top_k", type=int, default=50)
     parser.add_argument("--positive_chunks_per_aid", type=int, default=2)
     parser.add_argument("--threshold", type=float, default=0.5)
 
-    parser.add_argument("--train_ratio", type=float, default=0.55)
-    parser.add_argument("--router_train_ratio", type=float, default=0.15)
-    parser.add_argument("--val_ratio", type=float, default=0.15)
-    parser.add_argument("--test_ratio", type=float, default=0.15)
+    parser.add_argument("--train_ratio", type=float, default=0.70)
+    parser.add_argument("--router_train_ratio", type=float, default=0.10)
+    parser.add_argument("--val_ratio", type=float, default=0.10)
+    parser.add_argument("--test_ratio", type=float, default=0.10)
     parser.add_argument("--max_chunk_tokens", type=int, default=450)
     parser.add_argument("--chunk_overlap_sentences", type=int, default=1)
 

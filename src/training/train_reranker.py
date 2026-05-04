@@ -3,8 +3,6 @@ from __future__ import annotations
 import random
 from typing import Any
 
-from torch.utils.data import DataLoader
-
 from src.utils.artifact import ensure_dir, is_complete, mark_done, read_json, read_jsonl, stable_hash, write_json
 from src.utils.logging import saved, skip
 
@@ -51,6 +49,7 @@ def train_reranker(config: Any, *, kind: str = "bge") -> None:
         raise ValueError(f"No reranker training rows found for train split in {pairs_path}")
 
     from sentence_transformers import CrossEncoder, InputExample
+    from torch.utils.data import DataLoader
 
     examples = []
     for row in train_rows:

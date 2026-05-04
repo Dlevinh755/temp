@@ -20,6 +20,32 @@ EVAL_SOURCES = {
 }
 
 
+def _source_signature(config: Any) -> dict[str, Any]:
+    signature: dict[str, Any] = {}
+    for source, (filename, score_field) in EVAL_SOURCES.items():
+        paths = [retrieval_dir(config) / filename]
+        stem, suffix = filename.rsplit(".", 1)
+        paths.extend(retrieval_dir(config) / f"{stem}_{split_name}.{suffix}" for split_name in ["val", "test"])
+        for path in paths:
+            if path.exists():
+                stat = path.stat()
+                signature[str(path.name)] = {
+                    "source": source,
+                    "score_field": score_field,
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+    return signature
+
+
+def _source_path_for_split(config: Any, filename: str, split_name: str) -> Any:
+    stem, suffix = filename.rsplit(".", 1)
+    split_path = retrieval_dir(config) / f"{stem}_{split_name}.{suffix}"
+    if split_path.exists():
+        return split_path
+    return retrieval_dir(config) / filename
+
+
 def _filter_questions(questions: list[dict[str, Any]], qids: set[str]) -> list[dict[str, Any]]:
     return [row for row in questions if row["qid"] in qids]
 
@@ -68,7 +94,9 @@ def _compare_strategies(summary: dict[str, Any]) -> None:
 
 def evaluate(config: Any) -> None:
     path = eval_dir(config) / "summary.json"
-    if is_complete(path, expected={"params": {"threshold": config.threshold}}) and not config.force:
+    signature = _source_signature(config)
+    expected_params = {"threshold": config.threshold, "sources": signature}
+    if is_complete(path, expected={"params": expected_params}) and not config.force:
         skip(path)
         return
 
@@ -79,7 +107,7 @@ def evaluate(config: Any) -> None:
     for split_name in ["val", "test"]:
         split_questions = _filter_questions(questions, set(splits[split_name]))
         for source, (filename, score_field) in EVAL_SOURCES.items():
-            source_path = retrieval_dir(config) / filename
+            source_path = _source_path_for_split(config, filename, split_name)
             if not source_path.exists():
                 continue
             rows = read_table(source_path)
@@ -95,5 +123,5 @@ def evaluate(config: Any) -> None:
 
     _compare_strategies(summary)
     write_json(path, summary)
-    mark_done(path, config=config, stage="evaluate", input_hash=stable_hash(summary.keys()), params={"threshold": config.threshold}, fmt="json")
+    mark_done(path, config=config, stage="evaluate", input_hash=stable_hash({"summary": sorted(summary.keys()), "sources": signature}), params=expected_params, fmt="json")
     saved(path)

@@ -22,3 +22,33 @@ def search_dense(config: Any, questions: list[dict[str, Any]], top_k: int) -> li
             row["rank"] = rank
             rows.append(row)
     return rows
+
+
+def add_dense_labels_and_norm(rows: list[dict[str, Any]], questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    positives_by_qid = {row["qid"]: set(row["relevant_laws"]) for row in questions}
+    question_by_qid = {row["qid"]: row for row in questions}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(row["qid"], []).append(row)
+
+    output: list[dict[str, Any]] = []
+    for qid, items in grouped.items():
+        scores = [float(item.get("bge_score", 0.0)) for item in items]
+        lo = min(scores) if scores else 0.0
+        hi = max(scores) if scores else 0.0
+        denom = hi - lo
+        question = question_by_qid.get(qid, {})
+        positives = positives_by_qid.get(qid, set())
+        for item in items:
+            score = float(item.get("bge_score", 0.0))
+            normalized = (score - lo) / denom if abs(denom) > 1e-12 else 0.0
+            output.append(
+                {
+                    **item,
+                    "question": question.get("question", ""),
+                    "relevant_laws": sorted(positives),
+                    "label": 1 if item["aid"] in positives else 0,
+                    "bge_score_norm": normalized,
+                }
+            )
+    return output

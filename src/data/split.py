@@ -8,16 +8,34 @@ from src.utils.artifact import file_hash, is_complete, mark_done, prepared_dir, 
 from src.utils.logging import saved, skip
 
 
+CANONICAL_SPLITS = ["train", "router", "val", "test"]
+SPLIT_SCHEMA_VERSION = 2
+
+
 def _allocate_counts(total: int, ratios: list[float]) -> list[int]:
     positive = [idx for idx, ratio in enumerate(ratios) if ratio > 0]
-    counts = [0 for _ in ratios]
+    ratio_sum = sum(ratios)
+    if total < 0:
+        raise ValueError("Total question count cannot be negative.")
+    if ratio_sum <= 0:
+        raise ValueError("At least one split ratio must be positive.")
+
+    raw = [total * ratio / ratio_sum for ratio in ratios]
+    additions = [int(value) for value in raw]
+    counts = list(additions)
+
     if total >= len(positive):
         for idx in positive:
-            counts[idx] = 1
-    remaining = total - sum(counts)
-    raw = [remaining * ratio / sum(ratios) for ratio in ratios]
-    additions = [int(value) for value in raw]
-    counts = [count + addition for count, addition in zip(counts, additions)]
+            if counts[idx] == 0:
+                donor = max(
+                    (candidate for candidate in positive if counts[candidate] > 1),
+                    key=lambda candidate: counts[candidate],
+                    default=None,
+                )
+                if donor is not None:
+                    counts[donor] -= 1
+                    counts[idx] = 1
+
     leftover = total - sum(counts)
     order = sorted(range(len(ratios)), key=lambda idx: raw[idx] - additions[idx], reverse=True)
     for idx in order[:leftover]:
@@ -25,23 +43,63 @@ def _allocate_counts(total: int, ratios: list[float]) -> list[int]:
     return counts
 
 
+def _validate_split_qids(splits: dict[str, list[str]], all_qids: set[str]) -> None:
+    assigned: list[str] = []
+    for split_name in CANONICAL_SPLITS:
+        values = splits.get(split_name, [])
+        if len(values) != len(set(values)):
+            raise ValueError(f"Split {split_name!r} contains duplicate qids.")
+        assigned.extend(values)
+
+    assigned_set = set(assigned)
+    if len(assigned) != len(assigned_set):
+        raise ValueError("Splits are not disjoint; at least one qid appears in multiple splits.")
+    if assigned_set != all_qids:
+        missing = sorted(all_qids - assigned_set)
+        extra = sorted(assigned_set - all_qids)
+        raise ValueError(f"Splits are not exhaustive. Missing={missing[:10]} Extra={extra[:10]}")
+
+
+def _write_split_questions(config: Any, questions: list[dict[str, Any]], splits: dict[str, list[str]], expected_params: dict[str, Any]) -> None:
+    questions_by_qid = {row["qid"]: row for row in questions}
+    out_dir = prepared_dir(config)
+    input_hash = file_hash(config.questions_path)
+    for split_name in CANONICAL_SPLITS:
+        rows = [questions_by_qid[qid] for qid in splits[split_name]]
+        path = out_dir / f"{split_name}_questions.json"
+        write_json(path, rows)
+        mark_done(path, config=config, stage="split", input_hash=input_hash, params=expected_params, fmt="json")
+
+
 def split_dataset(config: Any) -> None:
-    path = prepared_dir(config) / "splits.json"
-    expected = {
-        "params": {
-            "train": config.train_ratio,
-            "router_train": config.router_train_ratio,
-            "val": config.val_ratio,
-            "test": config.test_ratio,
-            "seed": config.seed,
-        }
+    out_dir = prepared_dir(config)
+    path = out_dir / "splits.json"
+    summary_path = out_dir / "split_summary.json"
+    split_question_paths = [out_dir / f"{split_name}_questions.json" for split_name in CANONICAL_SPLITS]
+    expected_params = {
+        "schema_version": SPLIT_SCHEMA_VERSION,
+        "train": config.train_ratio,
+        "router": config.router_train_ratio,
+        "router_train": config.router_train_ratio,
+        "val": config.val_ratio,
+        "test": config.test_ratio,
+        "seed": config.seed,
     }
-    if is_complete(path, expected=expected) and not config.force:
+    expected = {"params": expected_params}
+    if (
+        is_complete(path, expected=expected)
+        and is_complete(summary_path, expected=expected)
+        and all(is_complete(split_path, expected=expected) for split_path in split_question_paths)
+        and not config.force
+    ):
         skip(path)
         return
 
     questions = load_questions(config)
     qids = sorted({row["qid"] for row in questions})
+    if not qids:
+        raise ValueError("No questions found. Split stage requires at least one qid.")
+
     rng = random.Random(config.seed)
     rng.shuffle(qids)
 
@@ -54,16 +112,42 @@ def split_dataset(config: Any) -> None:
     val_end = router_end + val_count
     splits = {
         "train": sorted(qids[:train_end]),
-        "router_train": sorted(qids[train_end:router_end]),
+        "router": sorted(qids[train_end:router_end]),
         "val": sorted(qids[router_end:val_end]),
         "test": sorted(qids[val_end:]),
     }
+    _validate_split_qids(splits, set(qids))
+    splits["router_train"] = list(splits["router"])
+
+    summary = {
+        "schema_version": SPLIT_SCHEMA_VERSION,
+        "total_questions": len(qids),
+        "counts": {split_name: len(splits[split_name]) for split_name in CANONICAL_SPLITS},
+        "ratios_requested": {
+            "train": config.train_ratio,
+            "router": config.router_train_ratio,
+            "val": config.val_ratio,
+            "test": config.test_ratio,
+        },
+        "ratios_actual": {
+            split_name: len(splits[split_name]) / max(len(qids), 1)
+            for split_name in CANONICAL_SPLITS
+        },
+        "seed": config.seed,
+        "aliases": {"router_train": "router"},
+    }
+
     write_json(path, splits)
+    write_json(summary_path, summary)
+    _write_split_questions(config, questions, splits, expected_params)
+    input_hash = file_hash(config.questions_path)
     mark_done(
         path,
         config=config,
         stage="split",
-        input_hash=file_hash(config.questions_path),
-        params=expected["params"],
+        input_hash=input_hash,
+        params=expected_params,
+        fmt="json",
     )
+    mark_done(summary_path, config=config, stage="split", input_hash=input_hash, params=expected_params, fmt="json")
     saved(path)

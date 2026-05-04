@@ -5,14 +5,25 @@ from collections import defaultdict
 from typing import Any
 
 
-DEFAULT_RANKING_KS = [1, 5, 10, 20, 50, 100]
-DEFAULT_NDCG_KS = [5, 10, 20]
+DEFAULT_RANKING_KS = [1, 3, 5, 10, 20]
+DEFAULT_NDCG_KS = [3, 5, 10, 20]
 
 
 def group_ranked(rows: list[dict[str, Any]], score_field: str | None = None) -> dict[str, list[dict[str, Any]]]:
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    grouped_by_aid: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     for row in rows:
-        grouped[row["qid"]].append(row)
+        qid = row["qid"]
+        aid = row["aid"]
+        current = grouped_by_aid[qid].get(aid)
+        if current is None:
+            grouped_by_aid[qid][aid] = row
+            continue
+        if score_field is None:
+            continue
+        if float(row.get(score_field, 0.0)) > float(current.get(score_field, 0.0)):
+            grouped_by_aid[qid][aid] = row
+
+    grouped = {qid: list(items_by_aid.values()) for qid, items_by_aid in grouped_by_aid.items()}
     if score_field:
         for qid, items in grouped.items():
             grouped[qid] = sorted(items, key=lambda row: float(row.get(score_field, 0.0)), reverse=True)
@@ -71,3 +82,24 @@ def threshold_metrics(rows: list[dict[str, Any]], questions: list[dict[str, Any]
     beta2 = 4
     f2 = (1 + beta2) * precision * recall / max(beta2 * precision + recall, 1e-12)
     return {"precision": precision, "recall": recall, "f2": f2}
+
+
+def tune_threshold(
+    rows: list[dict[str, Any]],
+    questions: list[dict[str, Any]],
+    *,
+    score_field: str,
+    candidate_thresholds: list[float] | None = None,
+) -> dict[str, float]:
+    thresholds = candidate_thresholds
+    if thresholds is None:
+        scores = sorted({float(row.get(score_field, 0.0)) for row in rows})
+        thresholds = scores or [0.0]
+
+    best: dict[str, float] | None = None
+    for threshold in thresholds:
+        metrics = threshold_metrics(rows, questions, score_field=score_field, threshold=threshold)
+        trial = {"threshold": float(threshold), **metrics}
+        if best is None or (trial["f2"], trial["recall"], trial["precision"]) > (best["f2"], best["recall"], best["precision"]):
+            best = trial
+    return best or {"threshold": 0.0, "precision": 0.0, "recall": 0.0, "f2": 0.0}
