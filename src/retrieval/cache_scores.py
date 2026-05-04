@@ -46,7 +46,20 @@ def retrieve_cache(config: Any) -> None:
     questions = load_questions(config)
     bm25_rows = search_bm25(config, questions, config.top_k)
     bge_rows = search_dense(config, questions, config.top_k)
+    
+    if not bm25_rows:
+        raise ValueError("No BM25 search results found. Check BM25 index.")
+    if not bge_rows:
+        raise ValueError("No BGE dense search results found. Check FAISS index and dense model.")
+    
     merged = _merge_scores(bm25_rows, bge_rows)
+    
+    unique_aids_bm25 = len(set(row["aid"] for row in bm25_rows))
+    unique_aids_bge = len(set(row["aid"] for row in bge_rows))
+    unique_aids_merged = len(set(row["aid"] for row in merged))
+    print(f"[retrieve_cache] BM25: {len(bm25_rows)} rows, {unique_aids_bm25} unique aids")
+    print(f"[retrieve_cache] BGE: {len(bge_rows)} rows, {unique_aids_bge} unique aids")
+    print(f"[retrieve_cache] Merged: {len(merged)} rows, {unique_aids_merged} unique aids")
 
     bm25_fmt = write_table(out_dir / "bm25_scores.parquet", bm25_rows)
     bge_fmt = write_table(out_dir / "bge_scores.parquet", bge_rows)

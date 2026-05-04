@@ -9,6 +9,17 @@ from src.utils.artifact import ensure_dir, is_complete, mark_done, read_json, re
 from src.utils.logging import saved, skip
 
 
+def _split_qids(qids: list[str], seed: int, train_ratio: float = 0.9) -> tuple[list[str], list[str]]:
+    shuffled = list(qids)
+    random.Random(seed).shuffle(shuffled)
+    if len(shuffled) <= 1:
+        return shuffled, []
+
+    split_index = int(len(shuffled) * train_ratio)
+    split_index = max(1, min(split_index, len(shuffled) - 1))
+    return shuffled[:split_index], shuffled[split_index:]
+
+
 def train_reranker(config: Any, *, kind: str = "bge") -> None:
     filename = "rerank_train_ready.jsonl" if kind == "bge" else "qwen_train_ready.jsonl"
     model_name = config.rerank_model if kind == "bge" else config.qwen_model
@@ -29,8 +40,13 @@ def train_reranker(config: Any, *, kind: str = "bge") -> None:
     pairs_path = config.dataset_dir / "negatives" / filename
     ready_rows = read_jsonl(pairs_path)
     splits = read_json(config.dataset_dir / "prepared" / "splits.json")
-    train_qids = set(splits["train"])
-    train_rows = [row for row in ready_rows if str(row["qid"]) in train_qids]
+    train_qids = sorted({str(qid) for qid in splits["train"]})
+    subtrain_qids, subval_qids = _split_qids(train_qids, config.seed, train_ratio=0.9)
+    subtrain_qids_set = set(subtrain_qids)
+    subval_qids_set = set(subval_qids)
+
+    train_rows = [row for row in ready_rows if str(row["qid"]) in subtrain_qids_set]
+    val_rows = [row for row in ready_rows if str(row["qid"]) in subval_qids_set]
     if not train_rows:
         raise ValueError(f"No reranker training rows found for train split in {pairs_path}")
 
@@ -69,8 +85,11 @@ def train_reranker(config: Any, *, kind: str = "bge") -> None:
             "pairs_path": str(pairs_path),
             "num_ready_rows": len(ready_rows),
             "num_train_rows": len(train_rows),
+            "num_val_rows": len(val_rows),
             "num_examples": len(examples),
             "train_qids": len(train_qids),
+            "subtrain_qids": len(subtrain_qids),
+            "subval_qids": len(subval_qids),
             "params": params,
         },
     )

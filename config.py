@@ -52,6 +52,14 @@ class Config:
     use_qwen_rerank: bool
     device: str
     batch_size: int
+    bge_train_batch_size: int
+    bge_epochs: int
+    bge_lr: float
+    bge_warmup_ratio: float
+    bge_max_length: int
+    bge_max_train_examples: int
+    bge_use_amp: bool
+    bge_negatives_per_example: int
     reranker_train_batch_size: int
     reranker_epochs: int
     reranker_lr: float
@@ -110,6 +118,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_qwen_rerank", type=str2bool, default=False)
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--bge_train_batch_size", type=int, default=16)
+    parser.add_argument("--bge_epochs", type=int, default=1)
+    parser.add_argument("--bge_lr", type=float, default=2e-5)
+    parser.add_argument("--bge_warmup_ratio", type=float, default=0.1)
+    parser.add_argument("--bge_max_length", type=int, default=512)
+    parser.add_argument("--bge_max_train_examples", type=int, default=0)
+    parser.add_argument("--bge_use_amp", type=str2bool, default=True)
+    parser.add_argument("--bge_negatives_per_example", type=int, default=3)
     parser.add_argument("--reranker_train_batch_size", type=int, default=4)
     parser.add_argument("--reranker_epochs", type=int, default=1)
     parser.add_argument("--reranker_lr", type=float, default=2e-5)

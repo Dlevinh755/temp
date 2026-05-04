@@ -34,6 +34,38 @@ def _rank(rows: list[dict[str, Any]], score_field: str) -> list[dict[str, Any]]:
     return output
 
 
+def _compare_strategies(summary: dict[str, Any]) -> None:
+    """Print comparison between hybrid_tuned (fixed) and hybrid_router (per-query alpha)."""
+    print("\n" + "="*70)
+    print("[HYBRID ROUTER EVALUATION] Comparing fixed alpha vs per-query alpha")
+    print("="*70)
+    
+    for split in ["val", "test"]:
+        tuned_key = f"hybrid_tuned_{split}"
+        router_key = f"hybrid_router_{split}"
+        
+        if tuned_key not in summary or router_key not in summary:
+            continue
+        
+        tuned = summary[tuned_key]
+        router = summary[router_key]
+        
+        print(f"\n[{split.upper()} SET]")
+        print(f"{'Metric':<15} {'hybrid_tuned':<15} {'hybrid_router':<15} {'Improvement':<15}")
+        print("-" * 60)
+        
+        for metric in ["hit@10", "recall@10", "ndcg@10"]:
+            tuned_val = tuned.get(metric, 0.0)
+            router_val = router.get(metric, 0.0)
+            if tuned_val > 0:
+                improvement = ((router_val - tuned_val) / tuned_val) * 100
+                print(f"{metric:<15} {tuned_val:<15.4f} {router_val:<15.4f} {improvement:+.2f}%")
+            else:
+                print(f"{metric:<15} {tuned_val:<15.4f} {router_val:<15.4f} N/A")
+    
+    print("="*70 + "\n")
+
+
 def evaluate(config: Any) -> None:
     path = eval_dir(config) / "summary.json"
     if is_complete(path, expected={"params": {"threshold": config.threshold}}) and not config.force:
@@ -61,6 +93,7 @@ def evaluate(config: Any) -> None:
                 **threshold_metrics(ranked, split_questions, score_field=score_field, threshold=config.threshold),
             }
 
+    _compare_strategies(summary)
     write_json(path, summary)
     mark_done(path, config=config, stage="evaluate", input_hash=stable_hash(summary.keys()), params={"threshold": config.threshold}, fmt="json")
     saved(path)

@@ -51,14 +51,23 @@ def dense_index_paths(config: Any) -> dict[str, Any]:
     }
 
 
+def _get_dense_model(config: Any) -> str:
+    """Try to use trained BGE model if it exists, otherwise fall back to pre-trained."""
+    trained_model_dir = config.dataset_dir / "models" / "bge_finetuned"
+    if trained_model_dir.exists() and (trained_model_dir / "pytorch_model.bin").exists():
+        return str(trained_model_dir)
+    return config.dense_model
+
+
 def build_dense_index(config: Any) -> None:
+    model = _get_dense_model(config)
     paths = dense_index_paths(config)
     if is_complete(paths["embeddings"]) and paths["chunk_ids"].exists() and not config.force:
         skip(paths["root"])
         return
 
     chunks = read_table(prepared_dir(config) / "chunks.parquet")
-    encoder = DenseEncoder(config.dense_model, config.device)
+    encoder = DenseEncoder(model, config.device)
     embeddings = encoder.encode([row["text"] for row in chunks], batch_size=config.batch_size)
     ensure_dir(paths["root"])
     np.save(paths["embeddings"], embeddings)
@@ -80,7 +89,7 @@ def build_dense_index(config: Any) -> None:
         config=config,
         stage="build_dense_index",
         input_hash=stable_hash([row["chunk_id"] for row in chunks]),
-        model=config.dense_model,
+        model=model,
         params={"device": config.device, "batch_size": config.batch_size},
         fmt=fmt,
     )
@@ -88,10 +97,11 @@ def build_dense_index(config: Any) -> None:
 
 
 def dense_search(config: Any, queries: list[str], top_k: int) -> list[list[dict[str, float | str]]]:
+    model = _get_dense_model(config)
     paths = dense_index_paths(config)
     chunk_ids = read_json(paths["chunk_ids"])
     embeddings = np.load(paths["embeddings"])
-    encoder = DenseEncoder(config.dense_model, config.device)
+    encoder = DenseEncoder(model, config.device)
     query_vectors = encoder.encode(queries, batch_size=config.batch_size)
 
     try:
@@ -117,6 +127,7 @@ def dense_search(config: Any, queries: list[str], top_k: int) -> list[list[dict[
 
 
 def score_positive_chunks(config: Any, questions: list[dict[str, Any]], *, top_n: int = 2) -> dict[str, dict[str, list[dict[str, float | str | int]]]]:
+    model = _get_dense_model(config)
     paths = dense_index_paths(config)
     chunk_ids = read_json(paths["chunk_ids"])
     chunk_to_aid = read_json(prepared_dir(config) / "chunk_to_aid.json")
@@ -127,7 +138,7 @@ def score_positive_chunks(config: Any, questions: list[dict[str, Any]], *, top_n
         aid = str(chunk_to_aid[str(chunk_id)])
         aid_to_indices.setdefault(aid, []).append(idx)
 
-    encoder = DenseEncoder(config.dense_model, config.device)
+    encoder = DenseEncoder(model, config.device)
     query_vectors = encoder.encode([row["question"] for row in questions], batch_size=config.batch_size)
 
     output: dict[str, dict[str, list[dict[str, float | str | int]]]] = {}
