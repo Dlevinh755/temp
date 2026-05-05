@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from src.data.loaders import load_questions
-from src.eval.metrics import ranking_metrics, threshold_metrics, tune_threshold
+from src.eval.metrics import ranking_metrics, threshold_metrics, topk_metrics, tune_threshold, tune_top_k
 from src.indexes.bm25_index import resolve_bm25_params
 from src.indexes.faiss_index import _get_dense_model
 from src.retrieval.bm25 import search_bm25
@@ -68,8 +68,10 @@ def _write_bge_metrics(
     pool_stats: dict[str, Any],
 ) -> None:
     threshold_info = tune_threshold(split_rows["val"], split_questions["val"], score_field="bge_score_norm")
+    topk_info = tune_top_k(split_rows["val"], split_questions["val"], score_field="bge_score_norm")
     for split_name, rows in split_rows.items():
         questions = split_questions[split_name]
+        tuned_top_k = int(topk_info["top_k"])
         metrics_path = eval_dir(config) / f"bge_{split_name}_metrics.json"
         payload = {
             "split": split_name,
@@ -80,6 +82,15 @@ def _write_bge_metrics(
                 "threshold": threshold_info["threshold"],
                 **threshold_metrics(rows, questions, score_field="bge_score_norm", threshold=threshold_info["threshold"]),
             },
+            "topk_fixed_3": {
+                "top_k": 3,
+                **topk_metrics(rows, questions, score_field="bge_score_norm", k=3),
+            },
+            "topk_tuned": {
+                "top_k": tuned_top_k,
+                **topk_metrics(rows, questions, score_field="bge_score_norm", k=tuned_top_k),
+            },
+            "topk_selection_split": "val",
             "threshold_selection_split": "val",
             "model": dense_model,
             "params": params,
@@ -98,6 +109,8 @@ def _write_bge_metrics(
             "score_field": "bge_score_norm",
             "best_threshold": float(threshold_info["threshold"]),
             "val": threshold_info,
+            "best_top_k": int(topk_info["top_k"]),
+            "topk_val": topk_info,
             "num_val_rows": len(split_rows["val"]),
             "model": dense_model,
             "candidate_pool": pool_stats.get("val", {}),

@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 
 from src.data.loaders import load_questions
-from src.eval.metrics import ranking_metrics, threshold_metrics, tune_threshold
+from src.eval.metrics import ranking_metrics, threshold_metrics, topk_metrics, tune_threshold, tune_top_k
 from src.retrieval.hybrid import apply_hybrid
 from src.utils.artifact import eval_dir, is_complete, mark_done, read_json, read_table, retrieval_dir, stable_hash, write_json, write_jsonl, write_pickle, write_table
 from src.utils.logging import saved, skip
@@ -146,13 +146,14 @@ def _write_hybrid_split(
     output_name: str,
     params: dict[str, Any],
     input_hash: str,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     ranked = apply_hybrid(rows, alpha_by_qid=alpha_by_qid, fixed_alpha=fixed_alpha)
     score_path = retrieval_dir(config) / f"{output_name}_scores_{split_name}.parquet"
     fmt = write_table(score_path, ranked)
     threshold = tune_threshold(ranked, questions, score_field="hybrid_score") if split_name == "val" else None
+    topk = tune_top_k(ranked, questions, score_field="hybrid_score") if split_name == "val" else None
     mark_done(score_path, config=config, stage="train_router", input_hash=input_hash, model=config.router_model, params={**params, "split": split_name, "output": output_name}, fmt=fmt)
-    return ranked, threshold or {}
+    return ranked, threshold or {}, topk or {}
 
 
 def _write_hybrid_metrics(
@@ -163,6 +164,7 @@ def _write_hybrid_metrics(
     questions: list[dict[str, Any]],
     *,
     threshold: float,
+    tuned_top_k: int,
     params: dict[str, Any],
     input_hash: str,
 ) -> dict[str, Any]:
@@ -174,6 +176,15 @@ def _write_hybrid_metrics(
             "threshold": threshold,
             **threshold_metrics(rows, questions, score_field="hybrid_score", threshold=threshold),
         },
+        "topk_fixed_3": {
+            "top_k": 3,
+            **topk_metrics(rows, questions, score_field="hybrid_score", k=3),
+        },
+        "topk_tuned": {
+            "top_k": tuned_top_k,
+            **topk_metrics(rows, questions, score_field="hybrid_score", k=tuned_top_k),
+        },
+        "topk_selection_split": "val",
         "threshold_selection_split": "val",
         "params": params,
         "num_questions": len(questions),
@@ -304,9 +315,11 @@ def train_router(config: Any) -> None:
     router_rows_by_split: dict[str, list[dict[str, Any]]] = {}
     fixed_val_threshold: dict[str, Any] = {}
     router_val_threshold: dict[str, Any] = {}
+    fixed_val_topk: dict[str, Any] = {}
+    router_val_topk: dict[str, Any] = {}
 
     for split_name in ["router", "val", "test"]:
-        fixed_rows, fixed_threshold = _write_hybrid_split(
+        fixed_rows, fixed_threshold, fixed_topk = _write_hybrid_split(
             config,
             split_name,
             split_rows[split_name],
@@ -317,7 +330,7 @@ def train_router(config: Any) -> None:
             params=expected_params,
             input_hash=input_hash,
         )
-        router_rows, router_threshold = _write_hybrid_split(
+        router_rows, router_threshold, router_topk = _write_hybrid_split(
             config,
             split_name,
             split_rows[split_name],
@@ -333,9 +346,13 @@ def train_router(config: Any) -> None:
         if split_name == "val":
             fixed_val_threshold = fixed_threshold
             router_val_threshold = router_threshold
+            fixed_val_topk = fixed_topk
+            router_val_topk = router_topk
 
     fixed_threshold_value = float(fixed_val_threshold.get("threshold", 0.0))
     router_threshold_value = float(router_val_threshold.get("threshold", 0.0))
+    fixed_topk_value = int(fixed_val_topk.get("top_k", 3))
+    router_topk_value = int(router_val_topk.get("top_k", 3))
     metrics_payload: dict[str, Any] = {
         "router_train": {
             "mse": mse,
@@ -358,6 +375,7 @@ def train_router(config: Any) -> None:
             fixed_rows_by_split[split_name],
             split_questions[split_name],
             threshold=fixed_threshold_value,
+            tuned_top_k=fixed_topk_value,
             params=expected_params,
             input_hash=input_hash,
         )
@@ -368,6 +386,7 @@ def train_router(config: Any) -> None:
             router_rows_by_split[split_name],
             split_questions[split_name],
             threshold=router_threshold_value,
+            tuned_top_k=router_topk_value,
             params=expected_params,
             input_hash=input_hash,
         )

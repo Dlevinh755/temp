@@ -33,6 +33,8 @@ STAGES = [
     "train_router",
     "rerank_bge",
     "rerank_qwen",
+    "train_llm_reranker",
+    "rerank_llm",
     "evaluate",
     "all",
 ]
@@ -52,6 +54,19 @@ class Config:
     rerank_model: str
     qwen_model: str
     use_qwen_rerank: bool
+    llm_rerank_model: str
+    llm_rerank_backend: str
+    use_llm_rerank: bool
+    llm_rerank_top_k: int
+    llm_rerank_train_batch_size: int
+    llm_rerank_grad_accum: int
+    llm_rerank_epochs: int
+    llm_rerank_lr: float
+    llm_rerank_max_length: int
+    llm_rerank_max_train_examples: int
+    llm_rerank_lora_r: int
+    llm_rerank_lora_alpha: int
+    llm_rerank_load_in_4bit: bool
     device: str
     batch_size: int
     bge_train_batch_size: int
@@ -122,6 +137,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rerank_model", default="BAAI/bge-reranker-v2-m3")
     parser.add_argument("--qwen_model", default="Qwen/Qwen3-Reranker-0.6B")
     parser.add_argument("--use_qwen_rerank", type=str2bool, default=False)
+    parser.add_argument("--llm_rerank_model", default="unsloth/Qwen3.5-4B-Base")
+    parser.add_argument("--llm_rerank_backend", default="unsloth_causal_lm", choices=["unsloth_causal_lm"])
+    parser.add_argument("--use_llm_rerank", type=str2bool, default=False)
+    parser.add_argument("--llm_rerank_top_k", type=int, default=20)
+    parser.add_argument("--llm_rerank_train_batch_size", type=int, default=1)
+    parser.add_argument("--llm_rerank_grad_accum", type=int, default=8)
+    parser.add_argument("--llm_rerank_epochs", type=int, default=1)
+    parser.add_argument("--llm_rerank_lr", type=float, default=2e-4)
+    parser.add_argument("--llm_rerank_max_length", type=int, default=1024)
+    parser.add_argument("--llm_rerank_max_train_examples", type=int, default=0)
+    parser.add_argument("--llm_rerank_lora_r", type=int, default=16)
+    parser.add_argument("--llm_rerank_lora_alpha", type=int, default=16)
+    parser.add_argument("--llm_rerank_load_in_4bit", type=str2bool, default=True)
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--bge_train_batch_size", type=int, default=16)

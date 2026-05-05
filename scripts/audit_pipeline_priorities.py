@@ -23,6 +23,9 @@ from scripts.check_summary_consistency import (
     check_rows_against_questions,
     check_split_leakage,
     check_training_ground_truth,
+    check_val_topk_application,
+    check_val_topk_is_best_f2,
+    check_val_threshold_is_best_f2,
     check_val_threshold_application,
     describe,
     done_path,
@@ -31,7 +34,7 @@ from scripts.check_summary_consistency import (
     top_pairs,
 )
 from src.data.loaders import load_questions
-from src.eval.metrics import ranking_metrics, threshold_metrics
+from src.eval.metrics import ranking_metrics, threshold_metrics, topk_metrics
 
 
 def section(index: int, title: str) -> None:
@@ -162,10 +165,12 @@ def check_rerank_chunk_to_aid_aggregation(dataset_dir: Path, rows_by_split: dict
             detail = read_json(detail_path)
             recomputed_ranking = ranking_metrics(rows, questions)
             recomputed_threshold = threshold_metrics(rows, questions, score_field="rerank_score", threshold=detail["threshold"]["threshold"])
+            recomputed_topk = topk_metrics(rows, questions, score_field="rerank_score", k=int(detail["topk_tuned"]["top_k"]))
             for metric in ["hit@10", "recall@10", "ndcg@10"]:
                 assert_close(f"bge_rerank_{split}.{metric}.aid_max_recomputed", detail["ranking"][metric], recomputed_ranking[metric])
             for metric in ["precision", "recall", "f2"]:
                 assert_close(f"bge_rerank_{split}.{metric}.aid_max_recomputed", detail["threshold"][metric], recomputed_threshold[metric])
+                assert_close(f"bge_rerank_{split}.topk_{metric}.aid_max_recomputed", detail["topk_tuned"][metric], recomputed_topk[metric])
         print(f"[ok] {split}: chunk->aid mapping valid and metrics recompute with aid_score=max(chunk_scores)")
 
 
@@ -260,6 +265,9 @@ def main() -> None:
 
     section(1, "summary.json threshold metrics")
     check_summary_thresholds(args.dataset_dir)
+    check_val_topk_application(args.dataset_dir / "eval", read_json(args.dataset_dir / "eval" / "summary.json"))
+    check_val_threshold_is_best_f2(args.dataset_dir, questions_by_qid)
+    check_val_topk_is_best_f2(args.dataset_dir, questions_by_qid)
 
     section(2, "rerank num_rows vs candidate_top_k")
     rows_by_split = check_rerank_num_rows(args.dataset_dir, candidate_top_k=args.candidate_top_k)

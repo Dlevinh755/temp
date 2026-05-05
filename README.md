@@ -20,7 +20,7 @@ Useful stages:
 prepare_training_data
 -> train_bge_retriever -> train_reranker
 -> tune_bm25 -> build_bm25 -> retrieve_cache -> tune_hybrid
--> train_router -> rerank_bge -> rerank_qwen(optional) -> evaluate
+-> train_router -> rerank_bge -> train_llm_reranker(optional) -> rerank_llm(optional) -> rerank_qwen(optional) -> evaluate
 ```
 
 `prepare_training_data` is the default way to run the data-preparation block. It replaces running these stages one by one:
@@ -181,5 +181,48 @@ outputs/<dataset>/eval/bge_rerank_threshold.json
 ```
 
 The BGE rerank threshold is tuned on `val` with `rerank_score`, then applied to `test` for precision/recall/F2. The rerank metrics include deltas against `hybrid_router` when the baseline metrics are available. `evaluate` prefers the split-specific cache when it exists, then falls back to the aggregate cache for older runs.
+
+Optional LLM reranking uses BGE rerank top-20 chunk candidates by default. The first backend is `unsloth_causal_lm`, which fine-tunes `unsloth/Qwen3.5-4B-Base` with a small LoRA causal-LM loop and does not use TRL. It scores each candidate with:
+
+```text
+llm_rerank_score = sigmoid(logit("1") - logit("0"))
+```
+
+Example:
+
+```bash
+python3 run.py \
+  --stage train_llm_reranker \
+  --dataset_name legalraw_full \
+  --corpus_path raw_data/legalraw/full/legal_corpus.json \
+  --questions_path raw_data/legalraw/full/train.json \
+  --output_dir outputs \
+  --use_llm_rerank true \
+  --llm_rerank_model unsloth/Qwen3.5-4B-Base \
+  --llm_rerank_backend unsloth_causal_lm \
+  --llm_rerank_train_batch_size 1 \
+  --llm_rerank_grad_accum 8
+
+python3 run.py \
+  --stage rerank_llm \
+  --dataset_name legalraw_full \
+  --corpus_path raw_data/legalraw/full/legal_corpus.json \
+  --questions_path raw_data/legalraw/full/train.json \
+  --output_dir outputs \
+  --use_llm_rerank true \
+  --llm_rerank_top_k 20
+```
+
+LLM rerank writes:
+
+```text
+outputs/<dataset>/models/llm_reranker/train_summary.json
+outputs/<dataset>/retrieval_cache/llm_rerank_scores_val.parquet
+outputs/<dataset>/retrieval_cache/llm_rerank_scores_test.parquet
+outputs/<dataset>/retrieval_cache/llm_rerank_scores.parquet
+outputs/<dataset>/eval/llm_rerank_val_metrics.json
+outputs/<dataset>/eval/llm_rerank_test_metrics.json
+outputs/<dataset>/eval/llm_rerank_threshold.json
+```
 
 `evaluate` builds `eval/summary.json` from the detailed per-method metrics files when they exist, so threshold metrics in the summary match files like `hybrid_router_val_metrics.json` and `bge_rerank_test_metrics.json`.

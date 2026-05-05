@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from src.data.loaders import load_questions
-from src.eval.metrics import ranking_metrics, threshold_metrics
+from src.eval.metrics import ranking_metrics, threshold_metrics, topk_metrics
 from src.retrieval.hybrid import apply_hybrid
 from src.utils.artifact import eval_dir, is_complete, mark_done, read_json, read_table, retrieval_dir, stable_hash, write_json
 from src.utils.logging import saved, skip
@@ -16,6 +16,7 @@ EVAL_SOURCES = {
     "hybrid_tuned": ("hybrid_tuned_scores.parquet", "hybrid_score"),
     "hybrid_router": ("hybrid_router_scores.parquet", "hybrid_score"),
     "rerank_bge": ("bge_rerank_scores.parquet", "rerank_score"),
+    "rerank_llm": ("llm_rerank_scores.parquet", "llm_rerank_score"),
     "rerank_qwen": ("qwen_rerank_scores.parquet", "qwen_rerank_score"),
 }
 
@@ -25,6 +26,7 @@ DETAIL_METRIC_FILES = {
     "hybrid_fixed": "hybrid_fixed_{split}_metrics.json",
     "hybrid_router": "hybrid_router_{split}_metrics.json",
     "rerank_bge": "bge_rerank_{split}_metrics.json",
+    "rerank_llm": "llm_rerank_{split}_metrics.json",
 }
 VAL_TUNED_SOURCES = set(DETAIL_METRIC_FILES)
 
@@ -77,6 +79,8 @@ def _rank(rows: list[dict[str, Any]], score_field: str) -> list[dict[str, Any]]:
 def _flatten_detail_metrics(payload: dict[str, Any]) -> dict[str, Any]:
     ranking = payload.get("ranking", {})
     threshold = payload.get("threshold", {})
+    topk_fixed_3 = payload.get("topk_fixed_3", {})
+    topk_tuned = payload.get("topk_tuned", {})
     if not threshold:
         raise ValueError(f"Detailed metrics for split={payload.get('split')} are missing threshold payload.")
     output = {**ranking}
@@ -86,6 +90,18 @@ def _flatten_detail_metrics(payload: dict[str, Any]) -> dict[str, Any]:
     for key in ["precision", "recall", "f2"]:
         if key in output and key in threshold:
             _assert_close(f"detail_metrics.{key}", output[key], threshold[key])
+    if topk_fixed_3:
+        output["topk_fixed_3"] = topk_fixed_3
+        output["precision@3"] = topk_fixed_3.get("precision@3", topk_fixed_3.get("precision"))
+        output["recall@3_micro"] = topk_fixed_3.get("recall@3", topk_fixed_3.get("recall"))
+        output["f2@3"] = topk_fixed_3.get("f2@3", topk_fixed_3.get("f2"))
+    if topk_tuned:
+        output["topk_tuned"] = topk_tuned
+        output["best_top_k"] = topk_tuned.get("top_k")
+        output["topk_precision"] = topk_tuned.get("precision")
+        output["topk_recall"] = topk_tuned.get("recall")
+        output["topk_f2"] = topk_tuned.get("f2")
+        output["topk_source"] = payload.get("topk_selection_split", "val")
     output["score_field"] = payload.get("score_field")
     output["threshold_source"] = payload.get("threshold_selection_split", "val")
     output["metrics_source"] = "detail_metrics"
@@ -195,6 +211,7 @@ def evaluate(config: Any) -> None:
             summary[key] = {
                 **ranking_metrics(ranked, split_questions),
                 **threshold_metrics(ranked, split_questions, score_field=score_field, threshold=config.threshold),
+                "topk_fixed_3": {"top_k": 3, **topk_metrics(ranked, split_questions, score_field=score_field, k=3)},
                 "threshold": config.threshold,
                 "score_field": score_field,
                 "threshold_source": "config.threshold",

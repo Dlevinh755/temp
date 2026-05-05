@@ -14,7 +14,7 @@ ROOT = _Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.eval.metrics import ranking_metrics, threshold_metrics
+from src.eval.metrics import ranking_metrics, threshold_metrics, topk_metrics, tune_threshold, tune_top_k
 from src.data.loaders import load_questions
 from src.utils.artifact import file_hash
 
@@ -25,6 +25,16 @@ DETAIL_METRIC_FILES = {
     "hybrid_fixed": "hybrid_fixed_{split}_metrics.json",
     "hybrid_router": "hybrid_router_{split}_metrics.json",
     "rerank_bge": "bge_rerank_{split}_metrics.json",
+    "rerank_llm": "llm_rerank_{split}_metrics.json",
+}
+
+SCORE_CACHE_FILES = {
+    "bm25": ("bm25_scores_{split}.parquet", "bm25_score_norm"),
+    "bge": ("bge_scores_{split}.parquet", "bge_score_norm"),
+    "hybrid_fixed": ("hybrid_fixed_scores_{split}.parquet", "hybrid_score"),
+    "hybrid_router": ("hybrid_router_scores_{split}.parquet", "hybrid_score"),
+    "rerank_bge": ("bge_rerank_scores_{split}.parquet", "rerank_score"),
+    "rerank_llm": ("llm_rerank_scores_{split}.parquet", "llm_rerank_score"),
 }
 
 CANONICAL_SPLITS = ["train", "router", "val", "test"]
@@ -334,6 +344,80 @@ def check_val_threshold_application(eval_dir: Path, summary: dict[str, Any]) -> 
     print("[ok] val-selected thresholds are reused for val/test in detailed metrics and summary")
 
 
+def check_val_topk_application(eval_dir: Path, summary: dict[str, Any]) -> None:
+    for method, pattern in DETAIL_METRIC_FILES.items():
+        val_path = eval_dir / pattern.format(split="val")
+        if not val_path.exists():
+            continue
+        val_detail = read_json(val_path)
+        if "topk_tuned" not in val_detail:
+            continue
+        val_top_k = int(val_detail["topk_tuned"]["top_k"])
+        for split in ["val", "test"]:
+            key = f"{method}_{split}"
+            detail_path = eval_dir / pattern.format(split=split)
+            if not detail_path.exists() or key not in summary:
+                continue
+            detail = read_json(detail_path)
+            selection_split = detail.get("topk_selection_split", "val")
+            if selection_split != "val":
+                raise AssertionError(f"{detail_path.name} topk_selection_split={selection_split!r}, expected 'val'")
+            assert_close(f"{key}.detail_topk_from_val", detail["topk_tuned"]["top_k"], val_top_k)
+            if "best_top_k" in summary[key]:
+                assert_close(f"{key}.summary_topk_from_val", summary[key]["best_top_k"], val_top_k)
+    print("[ok] val-selected top-k values are reused for val/test in detailed metrics and summary")
+
+
+def check_val_threshold_is_best_f2(dataset_dir: Path, questions_by_qid: dict[str, dict[str, Any]]) -> None:
+    splits_path = dataset_dir / "prepared" / "splits.json"
+    if not splits_path.exists() or not questions_by_qid:
+        return
+    split_qids = {str(qid) for qid in read_json(splits_path)["val"]}
+    val_questions = [question for qid, question in questions_by_qid.items() if qid in split_qids]
+    retrieval_dir = dataset_dir / "retrieval_cache"
+    eval_dir = dataset_dir / "eval"
+
+    for method, (cache_pattern, score_field) in SCORE_CACHE_FILES.items():
+        cache_path = retrieval_dir / cache_pattern.format(split="val")
+        detail_path = eval_dir / DETAIL_METRIC_FILES[method].format(split="val")
+        if not cache_path.exists() or not detail_path.exists():
+            continue
+        rows = read_records(cache_path)
+        detail = read_json(detail_path)
+        best = tune_threshold(rows, val_questions, score_field=score_field)
+        threshold = detail.get("threshold", {})
+        for metric in ["threshold", "precision", "recall", "f2"]:
+            assert_close(f"{method}_val.best_f2_{metric}", threshold[metric], best[metric])
+        print(f"[ok] {method}_val threshold maximizes F2 on val:", best)
+
+
+def check_val_topk_is_best_f2(dataset_dir: Path, questions_by_qid: dict[str, dict[str, Any]]) -> None:
+    splits_path = dataset_dir / "prepared" / "splits.json"
+    if not splits_path.exists() or not questions_by_qid:
+        return
+    split_qids = {str(qid) for qid in read_json(splits_path)["val"]}
+    val_questions = [question for qid, question in questions_by_qid.items() if qid in split_qids]
+    retrieval_dir = dataset_dir / "retrieval_cache"
+    eval_dir = dataset_dir / "eval"
+
+    for method, (cache_pattern, score_field) in SCORE_CACHE_FILES.items():
+        cache_path = retrieval_dir / cache_pattern.format(split="val")
+        detail_path = eval_dir / DETAIL_METRIC_FILES[method].format(split="val")
+        if not cache_path.exists() or not detail_path.exists():
+            continue
+        rows = read_records(cache_path)
+        detail = read_json(detail_path)
+        best = tune_top_k(rows, val_questions, score_field=score_field)
+        topk = detail.get("topk_tuned", {})
+        for metric in ["top_k", "precision", "recall", "f2"]:
+            assert_close(f"{method}_val.best_topk_{metric}", topk[metric], best[metric])
+        fixed_3 = detail.get("topk_fixed_3", {})
+        recomputed_3 = {"top_k": 3, **topk_metrics(rows, val_questions, score_field=score_field, k=3)}
+        for metric in ["top_k", "precision", "recall", "f2", "precision@3", "recall@3", "f2@3"]:
+            assert_close(f"{method}_val.topk3_{metric}", fixed_3[metric], recomputed_3[metric])
+        print(f"[ok] {method}_val top-k maximizes F2 on val:", best)
+
+
 def check_rows_against_questions(rows: list[dict[str, Any]], questions_by_qid: dict[str, dict[str, Any]], *, name: str) -> None:
     errors = []
     for idx, row in enumerate(rows):
@@ -462,6 +546,7 @@ def main() -> None:
     parser.add_argument("--dataset_dir", type=Path, required=True)
     parser.add_argument("--top_k", type=int, default=100)
     parser.add_argument("--candidate_top_k", type=int, default=50)
+    parser.add_argument("--llm_rerank_top_k", type=int, default=20)
     parser.add_argument("--rerank_model")
     parser.add_argument("--corpus_path", type=Path)
     parser.add_argument("--questions_path", type=Path)
@@ -496,6 +581,9 @@ def main() -> None:
         )
         check_training_ground_truth(args.dataset_dir, questions_by_qid)
     check_val_threshold_application(eval_dir, summary)
+    check_val_topk_application(eval_dir, summary)
+    check_val_threshold_is_best_f2(args.dataset_dir, questions_by_qid)
+    check_val_topk_is_best_f2(args.dataset_dir, questions_by_qid)
 
     router_metrics_path = eval_dir / "router_metrics.json"
     if router_metrics_path.exists():
@@ -664,11 +752,66 @@ def main() -> None:
             detail = read_json(detail_path)
             recomputed_ranking = ranking_metrics(rows, questions)
             recomputed_threshold = threshold_metrics(rows, questions, score_field="rerank_score", threshold=detail["threshold"]["threshold"])
+            recomputed_topk = topk_metrics(rows, questions, score_field="rerank_score", k=int(detail["topk_tuned"]["top_k"]))
             for metric in ["hit@10", "recall@10", "ndcg@10"]:
                 assert_close(f"bge_rerank_{split}.{metric}.recomputed", detail["ranking"][metric], recomputed_ranking[metric])
             for metric in ["precision", "recall", "f2"]:
                 assert_close(f"bge_rerank_{split}.{metric}.recomputed", detail["threshold"][metric], recomputed_threshold[metric])
+                assert_close(f"bge_rerank_{split}.topk_{metric}.recomputed", detail["topk_tuned"][metric], recomputed_topk[metric])
             print(f"[ok] bge_rerank_scores_{split} recomputes with aid_score=max(chunk_scores)")
+
+    for split in ["val", "test"]:
+        path = retrieval_dir / f"llm_rerank_scores_{split}.parquet"
+        if not path.exists():
+            continue
+        marker_path = done_path(path)
+        if not marker_path.exists():
+            raise AssertionError(f"missing marker: {marker_path}")
+        marker = read_json(marker_path)
+        params = marker.get("params", {})
+        expected_params = {
+            "schema_version": 1,
+            "candidate_top_k": args.llm_rerank_top_k,
+            "candidate_unit": "chunk",
+            "ranking_unit": "aid",
+            "source": "bge_rerank",
+            "split": split,
+        }
+        for key, expected_value in expected_params.items():
+            if params.get(key) != expected_value:
+                raise AssertionError(f"{marker_path.name} params[{key!r}]={params.get(key)!r}, expected {expected_value!r}")
+        rows = read_records(path)
+        counts = Counter(str(row["qid"]) for row in rows)
+        overflow = {qid: count for qid, count in counts.items() if count > args.llm_rerank_top_k}
+        if overflow:
+            raise AssertionError(f"llm_rerank_scores_{split} exceeds top_k={args.llm_rerank_top_k}: {sorted(overflow.items())[:5]}")
+        qid_chunk = Counter((str(row["qid"]), str(row.get("chunk_id", ""))) for row in rows)
+        dup_qid_chunk = sum(count - 1 for count in qid_chunk.values() if count > 1)
+        if dup_qid_chunk:
+            raise AssertionError(f"llm_rerank_scores_{split} has duplicate chunk-level candidates: {dup_qid_chunk}")
+        bad_scores = [float(row.get("llm_rerank_score", -1.0)) for row in rows if not (0.0 <= float(row.get("llm_rerank_score", -1.0)) <= 1.0)]
+        if bad_scores:
+            raise AssertionError(f"llm_rerank_scores_{split} has scores outside [0,1]: {bad_scores[:5]}")
+        source_path = retrieval_dir / f"bge_rerank_scores_{split}.parquet"
+        if not source_path.exists():
+            raise AssertionError(f"missing LLM rerank source cache: {source_path}")
+        source_rows = read_records(source_path)
+        allowed = {
+            (str(row["qid"]), str(row.get("chunk_id", "")))
+            for row in sorted(source_rows, key=lambda item: (str(item["qid"]), -float(item.get("rerank_score", 0.0))))
+        }
+        source_top = {}
+        for row in source_rows:
+            source_top.setdefault(str(row["qid"]), []).append(row)
+        allowed = {
+            (qid, str(row.get("chunk_id", "")))
+            for qid, items in source_top.items()
+            for row in sorted(items, key=lambda item: float(item.get("rerank_score", 0.0)), reverse=True)[: args.llm_rerank_top_k]
+        }
+        extra = sorted({(str(row["qid"]), str(row.get("chunk_id", ""))) for row in rows} - allowed)[:5]
+        if extra:
+            raise AssertionError(f"llm_rerank_scores_{split} contains candidates outside bge_rerank top{args.llm_rerank_top_k}: {extra}")
+        print(f"[ok] llm_rerank_scores_{split} uses bge_rerank top{args.llm_rerank_top_k} chunk candidates with scores in [0,1]")
 
     print(f"[done] checked={checked}")
 

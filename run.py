@@ -15,6 +15,8 @@ from src.retrieval.hybrid import tune_hybrid
 from src.training.train_router import train_router
 from src.rerank.bge_rerank import rerank_bge
 from src.rerank.qwen_rerank import rerank_qwen
+from src.training.train_llm_reranker import train_llm_reranker
+from src.rerank.llm_rerank import rerank_llm
 from src.eval.evaluate import evaluate
 
 
@@ -33,6 +35,8 @@ ORDER = [
     "train_router",
     "evaluate",
     "rerank_bge",
+    "train_llm_reranker",
+    "rerank_llm",
     "rerank_qwen",
     "evaluate",
 ]
@@ -65,6 +69,8 @@ HANDLERS = {
     "train_router": train_router,
     "rerank_bge": rerank_bge,
     "rerank_qwen": rerank_qwen,
+    "train_llm_reranker": train_llm_reranker,
+    "rerank_llm": rerank_llm,
     "evaluate": evaluate,
 }
 
@@ -82,6 +88,9 @@ def run(config: Config) -> None:
     for stage in stages:
         if stage == "rerank_qwen" and not config.use_qwen_rerank:
             print("[skip] rerank_qwen: --use_qwen_rerank false")
+            continue
+        if stage in {"train_llm_reranker", "rerank_llm"} and not config.use_llm_rerank:
+            print(f"[skip] {stage}: --use_llm_rerank false")
             continue
         print(f"[stage] {stage}")
         HANDLERS[stage](config)

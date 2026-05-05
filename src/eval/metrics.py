@@ -7,6 +7,7 @@ from typing import Any
 
 DEFAULT_RANKING_KS = [1, 3, 5, 10, 20]
 DEFAULT_NDCG_KS = [3, 5, 10, 20]
+DEFAULT_TOPK_TUNE_KS = [1, 2, 3, 5, 10, 20, 50, 100]
 
 
 def group_ranked(rows: list[dict[str, Any]], score_field: str | None = None) -> dict[str, list[dict[str, Any]]]:
@@ -93,6 +94,60 @@ def threshold_metrics(rows: list[dict[str, Any]], questions: list[dict[str, Any]
     return {"precision": precision, "recall": recall, "f2": f2}
 
 
+def topk_metrics(rows: list[dict[str, Any]], questions: list[dict[str, Any]], *, score_field: str, k: int) -> dict[str, float]:
+    positives_by_qid = {row["qid"]: set(row["relevant_laws"]) for row in questions}
+    grouped = group_ranked(rows, score_field=score_field)
+    tp = fp = fn = 0
+    for qid, positives in positives_by_qid.items():
+        predicted = {row["aid"] for row in grouped.get(qid, [])[:k]}
+        tp += len(predicted & positives)
+        fp += len(predicted - positives)
+        fn += len(positives - predicted)
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    beta2 = 4
+    f2 = (1 + beta2) * precision * recall / max(beta2 * precision + recall, 1e-12)
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f2": f2,
+        f"precision@{k}": precision,
+        f"recall@{k}": recall,
+        f"f2@{k}": f2,
+    }
+
+
+def tune_top_k(
+    rows: list[dict[str, Any]],
+    questions: list[dict[str, Any]],
+    *,
+    score_field: str,
+    candidate_ks: list[int] | None = None,
+) -> dict[str, float]:
+    if candidate_ks is None:
+        grouped = group_ranked(rows, score_field=score_field)
+        max_candidates = max((len(items) for items in grouped.values()), default=0)
+        candidate_ks = [k for k in DEFAULT_TOPK_TUNE_KS if k <= max_candidates]
+        if max_candidates and max_candidates not in candidate_ks:
+            candidate_ks.append(max_candidates)
+    candidate_ks = sorted({int(k) for k in candidate_ks if int(k) > 0})
+    if not candidate_ks:
+        candidate_ks = [1]
+
+    best: dict[str, float] | None = None
+    for k in candidate_ks:
+        metrics = topk_metrics(rows, questions, score_field=score_field, k=k)
+        trial = {"top_k": int(k), **metrics}
+        if best is None or (trial["f2"], trial["recall"], trial["precision"], -trial["top_k"]) > (
+            best["f2"],
+            best["recall"],
+            best["precision"],
+            -best["top_k"],
+        ):
+            best = trial
+    return best or {"top_k": 1, "precision": 0.0, "recall": 0.0, "f2": 0.0, "precision@1": 0.0, "recall@1": 0.0, "f2@1": 0.0}
+
+
 def tune_threshold(
     rows: list[dict[str, Any]],
     questions: list[dict[str, Any]],
@@ -115,7 +170,7 @@ def tune_threshold(
 
 
 def _infer_score_field(rows: list[dict[str, Any]]) -> str | None:
-    for field in ["rerank_score", "qwen_rerank_score", "hybrid_score", "bge_score_norm", "bm25_score_norm", "bge_score", "bm25_score"]:
+    for field in ["llm_rerank_score", "rerank_score", "qwen_rerank_score", "hybrid_score", "bge_score_norm", "bm25_score_norm", "bge_score", "bm25_score"]:
         if rows and field in rows[0]:
             return field
     return None
