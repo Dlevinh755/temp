@@ -10,72 +10,22 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from config import Config
+from config import build_parser
 from src.data.loaders import load_questions
 from src.eval.metrics import ranking_metrics, threshold_metrics, tune_threshold
 from src.indexes.faiss_index import _get_dense_model, dense_index_paths
 from src.utils.artifact import eval_dir, prepared_dir, read_json, read_table, retrieval_dir
 
 
-def _base_config(args: argparse.Namespace) -> Config:
-    return Config(
-        stage="evaluate",
-        dataset_name=args.dataset_name,
-        corpus_path=args.corpus_path,
-        questions_path=args.questions_path,
-        output_dir=args.output_dir,
-        force=False,
-        seed=42,
-        dense_model=args.dense_model,
-        rerank_model="",
-        qwen_model="",
-        use_qwen_rerank=False,
-        device=args.device,
-        batch_size=args.batch_size,
-        bge_train_batch_size=1,
-        bge_epochs=1,
-        bge_lr=2e-5,
-        bge_warmup_ratio=0.1,
-        bge_max_length=512,
-        bge_max_train_examples=0,
-        bge_use_amp=True,
-        bge_gradient_checkpointing=True,
-        bge_auto_batch_reduce=True,
-        bge_negatives_per_example=3,
-        reranker_train_batch_size=1,
-        reranker_epochs=1,
-        reranker_lr=2e-5,
-        reranker_warmup_ratio=0.1,
-        reranker_max_length=512,
-        reranker_max_train_examples=0,
-        reranker_use_amp=True,
-        bm25_k1=1.2,
-        bm25_b=0.9,
-        bm25_k1_grid="1.2",
-        bm25_b_grid="0.9",
-        bm25_tune_metric="recall@10",
-        use_tuned_bm25=True,
-        hybrid_alpha=0.5,
-        alpha_grid="0.5",
-        router_model="ridge",
-        top_k=args.top_k,
-        candidate_top_k=50,
-        positive_chunks_per_aid=2,
-        threshold=0.5,
-        train_ratio=0.7,
-        router_train_ratio=0.1,
-        val_ratio=0.1,
-        test_ratio=0.1,
-        max_chunk_tokens=450,
-        chunk_overlap_sentences=1,
-        corpus_law_id_field="law_id",
-        corpus_articles_field="content",
-        article_id_field="aid",
-        article_text_field="content_Article",
-        question_id_field="qid",
-        question_text_field="question",
-        relevant_ids_field="relevant_laws",
-    )
+def _parse_config(argv: list[str]) -> Any:
+    parser = build_parser()
+    args = parser.parse_args(["--stage", "evaluate", *argv])
+    ratios = args.train_ratio + args.router_train_ratio + args.val_ratio + args.test_ratio
+    if abs(ratios - 1.0) > 1e-6:
+        raise ValueError("--train_ratio + --router_train_ratio + --val_ratio + --test_ratio must equal 1.0")
+    from config import Config
+
+    return Config(**vars(args))
 
 
 def _filter_questions(questions: list[dict[str, Any]], qids: set[str]) -> list[dict[str, Any]]:
@@ -108,18 +58,24 @@ def _label_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _per_query_count_stats(rows: list[dict[str, Any]], top_k: int, num_questions: int) -> dict[str, Any]:
+    counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        counts[str(row["qid"])] += 1
+    values = list(counts.values())
+    return {
+        "expected_rows_if_aid_top_k_full": num_questions * top_k,
+        "actual_rows": len(rows),
+        "missing_vs_full_top_k": max(num_questions * top_k - len(rows), 0),
+        "min_aids_per_query": min(values) if values else 0,
+        "max_aids_per_query": max(values) if values else 0,
+        "avg_aids_per_query": (sum(values) / len(values)) if values else 0.0,
+        "note": "BGE searches chunks first, then collapses duplicate chunks to best chunk per aid before metrics.",
+    }
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Debug BGE retrieval cache, mapping, and metrics.")
-    parser.add_argument("--dataset_name", required=True)
-    parser.add_argument("--corpus_path", type=Path, required=True)
-    parser.add_argument("--questions_path", type=Path, required=True)
-    parser.add_argument("--output_dir", type=Path, default=Path("outputs"))
-    parser.add_argument("--dense_model", default="BAAI/bge-m3")
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--top_k", type=int, default=100)
-    args = parser.parse_args()
-    config = _base_config(args)
+    config = _parse_config(sys.argv[1:])
 
     root = config.dataset_dir
     print("[paths]")
@@ -161,6 +117,12 @@ def main() -> None:
             continue
         rows = read_table(cache_path)
         print(split_name, _label_stats(rows))
+        print(split_name, "candidate_count_stats:", _per_query_count_stats(rows, config.top_k, len(split_questions)))
+        metrics_path = eval_dir(config) / f"bge_{split_name}_metrics.json"
+        if metrics_path.exists():
+            metrics_payload = read_json(metrics_path)
+            if "candidate_pool" in metrics_payload:
+                print(split_name, "candidate_pool:", metrics_payload["candidate_pool"])
         tuned = tune_threshold(rows, split_questions, score_field="bge_score_norm")
         metrics = {
             **ranking_metrics(rows, split_questions),

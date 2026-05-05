@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import re
 from typing import Any
 
 from src.data.loaders import load_questions
@@ -9,7 +10,11 @@ from src.utils.logging import saved, skip
 
 
 CANONICAL_SPLITS = ["train", "router", "val", "test"]
-SPLIT_SCHEMA_VERSION = 2
+SPLIT_SCHEMA_VERSION = 3
+
+
+def _normalize_question_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text).strip().lower())
 
 
 def _allocate_counts(total: int, ratios: list[float]) -> list[int]:
@@ -71,10 +76,70 @@ def _write_split_questions(config: Any, questions: list[dict[str, Any]], splits:
         mark_done(path, config=config, stage="split", input_hash=input_hash, params=expected_params, fmt="json")
 
 
+def _split_leak_report(questions: list[dict[str, Any]], splits: dict[str, list[str]]) -> dict[str, Any]:
+    questions_by_qid = {str(row["qid"]): row for row in questions}
+    qids_by_split = {split_name: {str(qid) for qid in splits[split_name]} for split_name in CANONICAL_SPLITS}
+    question_text_by_split = {
+        split_name: {
+            _normalize_question_text(questions_by_qid[qid]["question"])
+            for qid in qids
+            if qid in questions_by_qid and _normalize_question_text(questions_by_qid[qid]["question"])
+        }
+        for split_name, qids in qids_by_split.items()
+    }
+    positive_aids_by_split = {
+        split_name: {
+            str(aid)
+            for qid in qids
+            for aid in questions_by_qid.get(qid, {}).get("relevant_laws", [])
+        }
+        for split_name, qids in qids_by_split.items()
+    }
+
+    pairwise: dict[str, Any] = {}
+    for left_idx, left in enumerate(CANONICAL_SPLITS):
+        for right in CANONICAL_SPLITS[left_idx + 1 :]:
+            key = f"{left}__{right}"
+            qid_overlap = sorted(qids_by_split[left] & qids_by_split[right])
+            text_overlap = sorted(question_text_by_split[left] & question_text_by_split[right])
+            positive_aid_overlap = sorted(positive_aids_by_split[left] & positive_aids_by_split[right])
+            pairwise[key] = {
+                "qid_overlap_count": len(qid_overlap),
+                "qid_overlap_examples": qid_overlap[:10],
+                "question_text_overlap_count": len(text_overlap),
+                "question_text_overlap_examples": text_overlap[:5],
+                "positive_aid_overlap_count": len(positive_aid_overlap),
+                "positive_aid_overlap_examples": positive_aid_overlap[:10],
+            }
+    return {
+        "schema_version": SPLIT_SCHEMA_VERSION,
+        "counts": {split_name: len(qids_by_split[split_name]) for split_name in CANONICAL_SPLITS},
+        "unique_question_text_counts": {split_name: len(question_text_by_split[split_name]) for split_name in CANONICAL_SPLITS},
+        "unique_positive_aid_counts": {split_name: len(positive_aids_by_split[split_name]) for split_name in CANONICAL_SPLITS},
+        "pairwise": pairwise,
+        "positive_aid_overlap_note": "Positive aid overlap across splits is reported for leakage analysis but not treated as fatal by default.",
+    }
+
+
+def _validate_no_question_text_overlap(report: dict[str, Any]) -> None:
+    overlaps = {
+        pair: payload
+        for pair, payload in report["pairwise"].items()
+        if int(payload.get("question_text_overlap_count", 0)) > 0
+    }
+    if overlaps:
+        examples = {
+            pair: payload.get("question_text_overlap_examples", [])
+            for pair, payload in overlaps.items()
+        }
+        raise ValueError(f"Question text appears in multiple splits: {examples}")
+
+
 def split_dataset(config: Any) -> None:
     out_dir = prepared_dir(config)
     path = out_dir / "splits.json"
     summary_path = out_dir / "split_summary.json"
+    leak_report_path = out_dir / "split_leak_report.json"
     split_question_paths = [out_dir / f"{split_name}_questions.json" for split_name in CANONICAL_SPLITS]
     expected_params = {
         "schema_version": SPLIT_SCHEMA_VERSION,
@@ -89,6 +154,7 @@ def split_dataset(config: Any) -> None:
     if (
         is_complete(path, expected=expected)
         and is_complete(summary_path, expected=expected)
+        and is_complete(leak_report_path, expected=expected)
         and all(is_complete(split_path, expected=expected) for split_path in split_question_paths)
         and not config.force
     ):
@@ -118,6 +184,8 @@ def split_dataset(config: Any) -> None:
     }
     _validate_split_qids(splits, set(qids))
     splits["router_train"] = list(splits["router"])
+    leak_report = _split_leak_report(questions, splits)
+    _validate_no_question_text_overlap(leak_report)
 
     summary = {
         "schema_version": SPLIT_SCHEMA_VERSION,
@@ -139,6 +207,7 @@ def split_dataset(config: Any) -> None:
 
     write_json(path, splits)
     write_json(summary_path, summary)
+    write_json(leak_report_path, leak_report)
     _write_split_questions(config, questions, splits, expected_params)
     input_hash = file_hash(config.questions_path)
     mark_done(
@@ -150,4 +219,5 @@ def split_dataset(config: Any) -> None:
         fmt="json",
     )
     mark_done(summary_path, config=config, stage="split", input_hash=input_hash, params=expected_params, fmt="json")
+    mark_done(leak_report_path, config=config, stage="split", input_hash=input_hash, params=expected_params, fmt="json")
     saved(path)

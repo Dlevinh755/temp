@@ -7,10 +7,13 @@ from src.eval.metrics import ranking_metrics, threshold_metrics, tune_threshold
 from src.indexes.bm25_index import resolve_bm25_params
 from src.indexes.faiss_index import _get_dense_model
 from src.retrieval.bm25 import search_bm25
-from src.retrieval.dense import add_dense_labels_and_norm, search_dense
+from src.retrieval.dense import add_dense_labels_and_norm, search_dense_with_stats
 from src.retrieval.tune_bm25 import _add_labels_and_norm as add_bm25_labels_and_norm
 from src.utils.artifact import eval_dir, is_complete, mark_done, read_json, retrieval_dir, stable_hash, write_json, write_table
 from src.utils.logging import saved, skip
+
+
+MERGED_SCORE_SCHEMA_VERSION = 3
 
 
 def _merge_scores(bm25_rows: list[dict[str, Any]], bge_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -19,20 +22,33 @@ def _merge_scores(bm25_rows: list[dict[str, Any]], bge_rows: list[dict[str, Any]
         key = (row["qid"], row["aid"])
         merged.setdefault(key, {"qid": row["qid"], "aid": row["aid"]})
         merged[key]["bm25_score"] = row["bm25_score"]
+        merged[key]["bm25_score_norm"] = row.get("bm25_score_norm", 0.0)
         merged[key]["bm25_rank"] = row["rank"]
+        merged[key]["question"] = row.get("question", "")
+        merged[key]["relevant_laws"] = row.get("relevant_laws", [])
+        merged[key]["label"] = row.get("label", 0)
     for row in bge_rows:
         key = (row["qid"], row["aid"])
         merged.setdefault(key, {"qid": row["qid"], "aid": row["aid"]})
         merged[key]["bge_score"] = row["bge_score"]
+        merged[key]["bge_score_norm"] = row.get("bge_score_norm", 0.0)
         merged[key]["bge_rank"] = row["rank"]
         merged[key]["chunk_id"] = row.get("chunk_id")
+        merged[key].setdefault("question", row.get("question", ""))
+        merged[key].setdefault("relevant_laws", row.get("relevant_laws", []))
+        merged[key]["label"] = max(int(merged[key].get("label", 0)), int(row.get("label", 0)))
 
     rows = []
     for row in merged.values():
         row.setdefault("bm25_score", 0.0)
         row.setdefault("bge_score", 0.0)
+        row.setdefault("bm25_score_norm", 0.0)
+        row.setdefault("bge_score_norm", 0.0)
         row.setdefault("bm25_rank", None)
         row.setdefault("bge_rank", None)
+        row.setdefault("question", "")
+        row.setdefault("relevant_laws", [])
+        row.setdefault("label", 0)
         rows.append(row)
     return rows
 
@@ -49,6 +65,7 @@ def _write_bge_metrics(
     dense_model: str,
     params: dict[str, Any],
     input_hash: str,
+    pool_stats: dict[str, Any],
 ) -> None:
     threshold_info = tune_threshold(split_rows["val"], split_questions["val"], score_field="bge_score_norm")
     for split_name, rows in split_rows.items():
@@ -63,8 +80,10 @@ def _write_bge_metrics(
                 "threshold": threshold_info["threshold"],
                 **threshold_metrics(rows, questions, score_field="bge_score_norm", threshold=threshold_info["threshold"]),
             },
+            "threshold_selection_split": "val",
             "model": dense_model,
             "params": params,
+            "candidate_pool": pool_stats.get(split_name, {}),
             "num_questions": len(questions),
             "num_rows": len(rows),
         }
@@ -81,6 +100,7 @@ def _write_bge_metrics(
             "val": threshold_info,
             "num_val_rows": len(split_rows["val"]),
             "model": dense_model,
+            "candidate_pool": pool_stats.get("val", {}),
         },
     )
     mark_done(threshold_path, config=config, stage="bge_threshold", input_hash=input_hash, model=dense_model, params=params, fmt="json")
@@ -91,7 +111,12 @@ def retrieve_cache(config: Any) -> None:
     merged_path = out_dir / "merged_scores.parquet"
     bm25_k1, bm25_b = resolve_bm25_params(config)
     dense_model = _get_dense_model(config)
-    params = {"top_k": config.top_k, "bm25_k1": bm25_k1, "bm25_b": bm25_b}
+    params = {
+        "top_k": config.top_k,
+        "bm25_k1": bm25_k1,
+        "bm25_b": bm25_b,
+        "merged_score_schema_version": MERGED_SCORE_SCHEMA_VERSION,
+    }
     expected = {"model": dense_model, "params": params}
     expected_paths = [
         merged_path,
@@ -119,11 +144,13 @@ def retrieve_cache(config: Any) -> None:
     all_bge_rows: list[dict[str, Any]] = []
     all_merged_rows: list[dict[str, Any]] = []
     bge_split_rows: dict[str, list[dict[str, Any]]] = {}
+    bge_pool_stats: dict[str, Any] = {}
     input_counts: dict[str, Any] = {}
 
     for split_name, rows_questions in split_questions.items():
         bm25_rows = add_bm25_labels_and_norm(search_bm25(config, rows_questions, config.top_k), rows_questions)
-        bge_rows = add_dense_labels_and_norm(search_dense(config, rows_questions, config.top_k), rows_questions)
+        bge_raw_rows, bge_pool_stats[split_name] = search_dense_with_stats(config, rows_questions, config.top_k)
+        bge_rows = add_dense_labels_and_norm(bge_raw_rows, rows_questions)
         if not bm25_rows:
             raise ValueError(f"No BM25 search results found for {split_name}. Check BM25 index.")
         if not bge_rows:
@@ -156,5 +183,5 @@ def retrieve_cache(config: Any) -> None:
     mark_done(out_dir / "bm25_scores.parquet", config=config, stage="retrieve_cache", input_hash=input_hash, params=params, fmt=bm25_fmt)
     mark_done(out_dir / "bge_scores.parquet", config=config, stage="retrieve_cache", input_hash=input_hash, model=dense_model, params=params, fmt=bge_fmt)
     mark_done(merged_path, config=config, stage="retrieve_cache", input_hash=input_hash, model=dense_model, params=params, fmt=merged_fmt)
-    _write_bge_metrics(config, bge_split_rows, split_questions, dense_model=dense_model, params=params, input_hash=input_hash)
+    _write_bge_metrics(config, bge_split_rows, split_questions, dense_model=dense_model, params=params, input_hash=input_hash, pool_stats=bge_pool_stats)
     saved(out_dir)

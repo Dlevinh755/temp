@@ -34,6 +34,14 @@ def _build_triplets(rows: list[dict[str, Any]], negatives_per_positive: int, see
     return triplets
 
 
+def _collate_triplets(batch: list[tuple[str, str, str]]) -> dict[str, list[str]]:
+    return {
+        "queries": [row[0] for row in batch],
+        "positives": [row[1] for row in batch],
+        "negatives": [row[2] for row in batch],
+    }
+
+
 def train_bge(config: Any) -> None:
     model_dir = config.dataset_dir / "models" / "bge_finetuned"
     marker = model_dir / "train_summary.json"
@@ -57,16 +65,32 @@ def train_bge(config: Any) -> None:
     triplets_path = config.dataset_dir / "negatives" / "bge_triplets.jsonl"
     ready_rows = read_jsonl(pairs_path)
     splits = read_json(config.dataset_dir / "prepared" / "splits.json")
-    train_qids = set(splits["train"])
+    train_qids = {str(qid) for qid in splits["train"]}
+    ready_qids = {str(row.get("qid", "")) for row in ready_rows if str(row.get("qid", "")).strip()}
+    leaked_ready_qids = sorted(ready_qids - train_qids)
+    if leaked_ready_qids:
+        raise ValueError(
+            "BGE training ready cache contains qids outside train split. "
+            f"Re-run mine_hard_negatives/sample_negatives with --force true. Examples: {leaked_ready_qids[:10]}"
+        )
     train_rows = [row for row in ready_rows if str(row["qid"]) in train_qids]
     if not train_rows:
         raise ValueError(f"No BGE training rows found for train split in {pairs_path}")
 
-    from sentence_transformers import InputExample, SentenceTransformer, losses, models
+    import torch
     from torch.utils.data import DataLoader
+    from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
 
     if triplets_path.exists():
-        triplet_rows = [row for row in read_jsonl(triplets_path) if str(row["qid"]) in train_qids]
+        all_triplet_rows = read_jsonl(triplets_path)
+        triplet_qids = {str(row.get("qid", "")) for row in all_triplet_rows if str(row.get("qid", "")).strip()}
+        leaked_triplet_qids = sorted(triplet_qids - train_qids)
+        if leaked_triplet_qids:
+            raise ValueError(
+                "BGE triplet cache contains qids outside train split. "
+                f"Re-run sample_negatives with --force true. Examples: {leaked_triplet_qids[:10]}"
+            )
+        triplet_rows = [row for row in all_triplet_rows if str(row["qid"]) in train_qids]
         triplets = [
             (str(row["query"]), str(row["positive"]), str(row["negative"]))
             for row in triplet_rows
@@ -83,8 +107,6 @@ def train_bge(config: Any) -> None:
     if not triplets:
         raise ValueError("No BGE training triplets were built.")
 
-    examples = [InputExample(texts=[query, positive, negative]) for query, positive, negative in triplets]
-
     ensure_dir(model_dir)
 
     print(f"[train_bge] GPU memory note:")
@@ -96,50 +118,91 @@ def train_bge(config: Any) -> None:
     print(f"  - Gradient checkpointing: {config.bge_gradient_checkpointing}")
     print(f"  - Auto batch reduce: {config.bge_auto_batch_reduce}")
     print(f"  - Use GPU: {config.device == 'cuda'}")
-    print(f"  - TripletLoss encodes 3 texts per item, so effective sequence batch is about 3x batch_size")
+    print(f"  - Custom contrastive loop encodes query/positive/negative in separate forwards to reduce peak memory")
     print(f"  - If CUDA OOM persists: try --bge_train_batch_size 2 --bge_max_length 384")
 
-    def build_model() -> SentenceTransformer:
-        word_embedding_model = models.Transformer(config.dense_model, max_seq_length=config.bge_max_length)
-        transformer = getattr(word_embedding_model, "auto_model", None)
-        if bool(config.bge_gradient_checkpointing) and transformer is not None:
-            if hasattr(transformer, "gradient_checkpointing_enable"):
-                transformer.gradient_checkpointing_enable()
-            if getattr(transformer, "config", None) is not None and hasattr(transformer.config, "use_cache"):
-                transformer.config.use_cache = False
-        pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension())
-        return SentenceTransformer(modules=[word_embedding_model, pooling_model], device=config.device)
+    device = torch.device(config.device if config.device == "cuda" and torch.cuda.is_available() else "cpu")
+
+    def mean_pool(last_hidden_state: Any, attention_mask: Any) -> Any:
+        mask = attention_mask.unsqueeze(-1).float()
+        summed = torch.sum(last_hidden_state * mask, dim=1)
+        counts = torch.clamp(mask.sum(dim=1), min=1e-9)
+        return summed / counts
+
+    def encode_texts(texts: list[str], encoder: Any, tokenizer: Any) -> Any:
+        inputs = tokenizer(
+            [str(text or "") for text in texts],
+            padding=True,
+            truncation=True,
+            max_length=config.bge_max_length,
+            return_tensors="pt",
+        )
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+        outputs = encoder(**inputs)
+        embeddings = mean_pool(outputs.last_hidden_state, inputs["attention_mask"])
+        return torch.nn.functional.normalize(embeddings, p=2, dim=1)
+
+    def contrastive_loss(query_embeddings: Any, positive_embeddings: Any, negative_embeddings: Any) -> Any:
+        candidates = torch.cat([positive_embeddings, negative_embeddings], dim=0)
+        logits = torch.matmul(query_embeddings, candidates.T) / 0.05
+        labels = torch.arange(query_embeddings.size(0), device=device)
+        return torch.nn.CrossEntropyLoss()(logits, labels)
+
+    def build_model() -> tuple[Any, Any]:
+        tokenizer = AutoTokenizer.from_pretrained(config.dense_model)
+        encoder = AutoModel.from_pretrained(config.dense_model).to(device)
+        if bool(config.bge_gradient_checkpointing) and hasattr(encoder, "gradient_checkpointing_enable"):
+            encoder.gradient_checkpointing_enable()
+            if getattr(encoder, "config", None) is not None and hasattr(encoder.config, "use_cache"):
+                encoder.config.use_cache = False
+        return tokenizer, encoder
 
     def clear_cuda() -> None:
         gc.collect()
         if config.device == "cuda":
             try:
-                import torch
-
                 torch.cuda.empty_cache()
             except Exception:
                 pass
 
     batch_size = max(1, int(config.bge_train_batch_size))
     last_oom: RuntimeError | None = None
-    model = None
+    tokenizer = None
+    encoder = None
     while batch_size >= 1:
         clear_cuda()
-        model = build_model()
-        train_dataloader = DataLoader(examples, shuffle=True, batch_size=batch_size)
+        tokenizer, encoder = build_model()
+        train_dataloader = DataLoader(triplets, shuffle=True, batch_size=batch_size, collate_fn=_collate_triplets, num_workers=0)
         warmup_steps = int(len(train_dataloader) * config.bge_epochs * config.bge_warmup_ratio)
-        train_loss = losses.TripletLoss(model)
+        optimizer = torch.optim.AdamW(encoder.parameters(), lr=config.bge_lr, weight_decay=0.01)
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=max(1, len(train_dataloader) * config.bge_epochs),
+        )
+        scaler = torch.cuda.amp.GradScaler(enabled=bool(config.bge_use_amp and device.type == "cuda"))
         try:
             print(f"[train_bge] training with batch_size={batch_size}")
-            model.fit(
-                train_objectives=[(train_dataloader, train_loss)],
-                epochs=config.bge_epochs,
-                warmup_steps=warmup_steps,
-                optimizer_params={"lr": config.bge_lr},
-                output_path=None,
-                save_best_model=False,
-                use_amp=bool(config.bge_use_amp and config.device == "cuda"),
-            )
+            encoder.train()
+            for epoch in range(config.bge_epochs):
+                total_loss = 0.0
+                for step, batch in enumerate(train_dataloader, start=1):
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.cuda.amp.autocast(enabled=bool(config.bge_use_amp and device.type == "cuda")):
+                        query_embeddings = encode_texts(batch["queries"], encoder, tokenizer)
+                        positive_embeddings = encode_texts(batch["positives"], encoder, tokenizer)
+                        negative_embeddings = encode_texts(batch["negatives"], encoder, tokenizer)
+                        loss = contrastive_loss(query_embeddings, positive_embeddings, negative_embeddings)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    total_loss += float(loss.detach().cpu())
+                    if step == 1 or step % 50 == 0 or step == len(train_dataloader):
+                        avg_loss = total_loss / step
+                        print(f"[train_bge] epoch={epoch + 1}/{config.bge_epochs} step={step}/{len(train_dataloader)} loss={avg_loss:.4f}")
             break
         except RuntimeError as exc:
             message = str(exc).lower()
@@ -148,15 +211,29 @@ def train_bge(config: Any) -> None:
                 raise
             last_oom = exc
             print(f"[warn] CUDA OOM at batch_size={batch_size}; retrying with batch_size={max(1, batch_size // 2)}")
-            del model
-            model = None
+            del encoder
+            del tokenizer
+            encoder = None
+            tokenizer = None
             clear_cuda()
             batch_size //= 2
 
-    if model is None:
+    if encoder is None or tokenizer is None:
         raise RuntimeError("BGE training failed before model initialization.") from last_oom
 
-    model.save(str(model_dir))
+    hf_tmp_dir = model_dir / "_hf_transformer"
+    ensure_dir(hf_tmp_dir)
+    encoder.save_pretrained(hf_tmp_dir)
+    tokenizer.save_pretrained(hf_tmp_dir)
+    del encoder
+    clear_cuda()
+
+    from sentence_transformers import SentenceTransformer, models
+
+    word_embedding_model = models.Transformer(str(hf_tmp_dir), max_seq_length=config.bge_max_length)
+    pooling_model = models.Pooling(word_embedding_model.get_word_embedding_dimension())
+    st_model = SentenceTransformer(modules=[word_embedding_model, pooling_model], device="cpu")
+    st_model.save(str(model_dir))
     expected_model_files = ["modules.json", "config_sentence_transformers.json"]
     missing_model_files = [name for name in expected_model_files if not (model_dir / name).exists()]
     if missing_model_files:
@@ -167,12 +244,13 @@ def train_bge(config: Any) -> None:
         {
             "status": "complete",
             "base_model": config.dense_model,
+            "checkpoint_path": str(model_dir),
             "pairs_path": str(pairs_path),
             "triplets_path": str(triplets_path) if triplets_path.exists() else "",
             "num_ready_rows": len(ready_rows),
             "num_train_rows": len(train_rows),
             "num_triplet_rows": len(triplet_rows),
-            "num_examples": len(examples),
+            "num_examples": len(triplets),
             "train_qids": len(train_qids),
             "effective_batch_size": batch_size,
             "params": params,
@@ -182,7 +260,7 @@ def train_bge(config: Any) -> None:
         marker,
         config=config,
         stage="train_bge",
-        input_hash=stable_hash({"examples": len(examples), "qids": sorted(train_qids)}),
+        input_hash=stable_hash({"examples": len(triplets), "qids": sorted(train_qids)}),
         model=config.dense_model,
         params=params,
         fmt="json",

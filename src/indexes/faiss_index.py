@@ -10,6 +10,9 @@ from src.utils.artifact import ensure_dir, file_hash, is_complete, mark_done, pr
 from src.utils.logging import saved, skip
 
 
+DENSE_INDEX_SCHEMA_VERSION = 2
+
+
 def _hash_vector(text: str, dim: int = 384) -> np.ndarray:
     vector = np.zeros(dim, dtype=np.float32)
     for token in text.lower().split():
@@ -74,6 +77,23 @@ def _dense_model_key(model: str) -> str:
     return stable_hash(model)
 
 
+def _dense_model_identity(config: Any, model: str) -> dict[str, Any]:
+    path = Path(model)
+    identity: dict[str, Any] = {
+        "dense_model_requested": config.dense_model,
+        "dense_model_resolved": model,
+        "model_key": _dense_model_key(model),
+        "is_local_checkpoint": path.exists(),
+    }
+    if path.exists():
+        marker = path / "train_summary.json"
+        marker_done = path / "train_summary.json.done.json"
+        identity["checkpoint_path"] = str(path)
+        identity["train_summary_hash"] = file_hash(marker) if marker.exists() else ""
+        identity["train_summary_done_hash"] = file_hash(marker_done) if marker_done.exists() else ""
+    return identity
+
+
 def dense_index_paths(config: Any) -> dict[str, Any]:
     model = _get_dense_model(config)
     model_key = _dense_model_key(model)
@@ -91,7 +111,13 @@ def dense_index_paths(config: Any) -> dict[str, Any]:
 def build_dense_index(config: Any) -> None:
     model = _get_dense_model(config)
     paths = dense_index_paths(config)
-    expected_params = {"device": config.device, "batch_size": config.batch_size, "model_key": _dense_model_key(model)}
+    model_identity = _dense_model_identity(config, model)
+    expected_params = {
+        "schema_version": DENSE_INDEX_SCHEMA_VERSION,
+        "device": config.device,
+        "batch_size": config.batch_size,
+        "model_key": model_identity["model_key"],
+    }
     if (
         is_complete(paths["embeddings"], expected={"model": model, "params": expected_params})
         and is_complete(paths["chunk_ids"], expected={"model": model, "params": expected_params})
@@ -126,9 +152,8 @@ def build_dense_index(config: Any) -> None:
         fmt = "numpy_bruteforce"
 
     metadata = {
-        "dense_model_requested": config.dense_model,
-        "dense_model_resolved": model,
-        "model_key": expected_params["model_key"],
+        **model_identity,
+        "schema_version": DENSE_INDEX_SCHEMA_VERSION,
         "backend": encoder.backend,
         "index_format": fmt,
         "chunk_count": len(chunks),
@@ -153,19 +178,55 @@ def build_dense_index(config: Any) -> None:
     saved(paths["root"])
 
 
+def _validate_dense_index_metadata(config: Any, *, model: str, paths: dict[str, Any]) -> dict[str, Any]:
+    if not paths["metadata"].exists():
+        raise FileNotFoundError(f"Missing dense index metadata: {paths['metadata']}. Re-run build_dense_index.")
+    metadata = read_json(paths["metadata"])
+    if int(metadata.get("schema_version", 0)) != DENSE_INDEX_SCHEMA_VERSION:
+        raise ValueError(
+            f"Dense index metadata schema_version={metadata.get('schema_version')}, expected {DENSE_INDEX_SCHEMA_VERSION}. "
+            "Re-run build_dense_index with --force true."
+        )
+    model_identity = _dense_model_identity(config, model)
+    for key in ["dense_model_requested", "dense_model_resolved", "model_key"]:
+        if metadata.get(key) != model_identity.get(key):
+            raise ValueError(
+                f"Dense index metadata mismatch for {key}: metadata={metadata.get(key)!r}, "
+                f"current={model_identity.get(key)!r}. Re-run build_dense_index with --force true."
+            )
+    if model_identity.get("is_local_checkpoint"):
+        for key in ["train_summary_hash", "train_summary_done_hash"]:
+            if metadata.get(key, "") != model_identity.get(key, ""):
+                raise ValueError(
+                    f"Dense index was built from a different fine-tuned checkpoint ({key} mismatch). "
+                    "Re-run build_dense_index or train_bge_retriever with --force true."
+                )
+    return metadata
+
+
 def dense_search(config: Any, queries: list[str], top_k: int) -> list[list[dict[str, float | str]]]:
     model = _get_dense_model(config)
     paths = dense_index_paths(config)
     if not paths["embeddings"].exists() or not paths["chunk_ids"].exists():
         raise FileNotFoundError(f"Missing dense index artifacts under {paths['root']}. Run build_dense_index first.")
+    metadata = _validate_dense_index_metadata(config, model=model, paths=paths)
 
     chunk_ids = read_json(paths["chunk_ids"])
     embeddings = np.load(paths["embeddings"])
     if len(chunk_ids) != embeddings.shape[0]:
         raise ValueError(f"Dense index mismatch: {len(chunk_ids)} chunk ids for {embeddings.shape[0]} embeddings.")
+    if int(metadata.get("chunk_count", -1)) != len(chunk_ids):
+        raise ValueError(f"Dense index metadata chunk_count mismatch: {metadata.get('chunk_count')} != {len(chunk_ids)}.")
+    if int(metadata.get("embedding_dim", -1)) != int(embeddings.shape[1]):
+        raise ValueError(f"Dense index metadata embedding_dim mismatch: {metadata.get('embedding_dim')} != {embeddings.shape[1]}.")
 
     encoder = DenseEncoder(model, config.device)
     query_vectors = encoder.encode(queries, batch_size=config.batch_size)
+    if query_vectors.ndim != 2 or query_vectors.shape[1] != embeddings.shape[1]:
+        raise ValueError(
+            f"Query encoder dimension {query_vectors.shape} does not match passage index dim {embeddings.shape[1]}. "
+            "Check dense_model/fine-tuned checkpoint and rebuild dense index."
+        )
     search_k = min(max(top_k, 0), embeddings.shape[0])
     if search_k == 0:
         return [[] for _ in queries]
@@ -197,12 +258,15 @@ def score_positive_chunks(config: Any, questions: list[dict[str, Any]], *, top_n
     paths = dense_index_paths(config)
     if not paths["embeddings"].exists() or not paths["chunk_ids"].exists():
         raise FileNotFoundError(f"Missing dense index artifacts under {paths['root']}. Run build_dense_index first.")
+    metadata = _validate_dense_index_metadata(config, model=model, paths=paths)
 
     chunk_ids = read_json(paths["chunk_ids"])
     chunk_to_aid = read_json(prepared_dir(config) / "chunk_to_aid.json")
     embeddings = np.load(paths["embeddings"])
     if len(chunk_ids) != embeddings.shape[0]:
         raise ValueError(f"Dense index mismatch: {len(chunk_ids)} chunk ids for {embeddings.shape[0]} embeddings.")
+    if int(metadata.get("embedding_dim", -1)) != int(embeddings.shape[1]):
+        raise ValueError(f"Dense index metadata embedding_dim mismatch: {metadata.get('embedding_dim')} != {embeddings.shape[1]}.")
 
     aid_to_indices: dict[str, list[int]] = {}
     for idx, chunk_id in enumerate(chunk_ids):
@@ -211,6 +275,11 @@ def score_positive_chunks(config: Any, questions: list[dict[str, Any]], *, top_n
 
     encoder = DenseEncoder(model, config.device)
     query_vectors = encoder.encode([row["question"] for row in questions], batch_size=config.batch_size)
+    if query_vectors.ndim != 2 or query_vectors.shape[1] != embeddings.shape[1]:
+        raise ValueError(
+            f"Query encoder dimension {query_vectors.shape} does not match passage index dim {embeddings.shape[1]}. "
+            "Check dense_model/fine-tuned checkpoint and rebuild dense index."
+        )
 
     output: dict[str, dict[str, list[dict[str, float | str | int]]]] = {}
     for question, query_vector in zip(questions, query_vectors):

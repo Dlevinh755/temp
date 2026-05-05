@@ -86,6 +86,7 @@ def _write_bm25_split_eval(config: Any, index: SimpleBM25, questions: list[dict[
             "top_k": config.top_k,
             "ranking": ranked_metrics,
             "threshold": threshold_metrics_payload,
+            "threshold_selection_split": "val",
             "params": params,
             "num_questions": len(rows_questions),
             "num_rows": len(rows),
@@ -100,7 +101,7 @@ def _write_bm25_split_eval(config: Any, index: SimpleBM25, questions: list[dict[
         {
             "selection_split": "val",
             "score_field": "bm25_score_norm",
-            "best_threshold": float(threshold_info.get("threshold", config.threshold)),
+            "best_threshold": float(threshold_info["threshold"]),
             "val": threshold_info,
             "num_val_rows": len(val_rows),
         },

@@ -30,6 +30,14 @@ def group_ranked(rows: list[dict[str, Any]], score_field: str | None = None) -> 
     return grouped
 
 
+def aggregate_by_aid_max(rows: list[dict[str, Any]], score_field: str) -> list[dict[str, Any]]:
+    grouped = group_ranked(rows, score_field=score_field)
+    output: list[dict[str, Any]] = []
+    for items in grouped.values():
+        output.extend(items)
+    return output
+
+
 def recall_at_k(rows: list[dict[str, Any]], question: dict[str, Any], k: int) -> float:
     grouped = group_ranked(rows)
     hits = {row["aid"] for row in grouped.get(question["qid"], [])[:k]}
@@ -43,7 +51,8 @@ def _dcg(labels: list[int]) -> float:
 
 def ranking_metrics(rows: list[dict[str, Any]], questions: list[dict[str, Any]], ks: list[int] | None = None) -> dict[str, float]:
     ks = ks or DEFAULT_RANKING_KS
-    grouped = group_ranked(rows)
+    score_field = _infer_score_field(rows)
+    grouped = group_ranked(rows, score_field=score_field)
     totals: dict[str, float] = defaultdict(float)
     count = max(len(questions), 1)
 
@@ -69,7 +78,7 @@ def threshold_metrics(rows: list[dict[str, Any]], questions: list[dict[str, Any]
     positives_by_qid = {row["qid"]: set(row["relevant_laws"]) for row in questions}
     tp = fp = fn = 0
     predicted_by_qid: dict[str, set[str]] = defaultdict(set)
-    for row in rows:
+    for row in aggregate_by_aid_max(rows, score_field):
         if float(row.get(score_field, 0.0)) >= threshold:
             predicted_by_qid[row["qid"]].add(row["aid"])
     for qid, positives in positives_by_qid.items():
@@ -93,7 +102,7 @@ def tune_threshold(
 ) -> dict[str, float]:
     thresholds = candidate_thresholds
     if thresholds is None:
-        scores = sorted({float(row.get(score_field, 0.0)) for row in rows})
+        scores = sorted({float(row.get(score_field, 0.0)) for row in aggregate_by_aid_max(rows, score_field)})
         thresholds = scores or [0.0]
 
     best: dict[str, float] | None = None
@@ -103,3 +112,10 @@ def tune_threshold(
         if best is None or (trial["f2"], trial["recall"], trial["precision"]) > (best["f2"], best["recall"], best["precision"]):
             best = trial
     return best or {"threshold": 0.0, "precision": 0.0, "recall": 0.0, "f2": 0.0}
+
+
+def _infer_score_field(rows: list[dict[str, Any]]) -> str | None:
+    for field in ["rerank_score", "qwen_rerank_score", "hybrid_score", "bge_score_norm", "bm25_score_norm", "bge_score", "bm25_score"]:
+        if rows and field in rows[0]:
+            return field
+    return None

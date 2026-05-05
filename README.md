@@ -72,9 +72,11 @@ python3 scripts/make_legalraw_sample.py \
   --input_dir raw_data/legalraw/full \
   --output_dir raw_data/legalraw/sample_100q \
   --num_questions 100 \
-  --num_extra_laws 100 \
+  --num_extra_articles 300 \
   --seed 42
 ```
+
+The sample script defaults to article-level sampling: it keeps only the relevant `aid` articles for sampled qids, then adds random extra non-positive `aid` articles. Avoid `--num_extra_laws` for smoke tests because one law can contain many articles and inflate chunk count.
 
 Prepare training data on the sample by only changing paths:
 
@@ -110,7 +112,7 @@ After `prepare_training_data` finishes, continue with model training stages such
 
 `train_bge_retriever` runs `train_bge -> build_dense_index` together. The first dense index from `prepare_training_data` is for mining hard negatives with the base model; the second dense index from `train_bge_retriever` uses `outputs/<dataset>/models/bge_finetuned` for retrieval/evaluation caches.
 
-BGE retrieval training can use a lot of GPU memory because triplet loss encodes query, positive, and negative texts for every item. The training stage supports memory guards:
+BGE retrieval training uses a custom Hugging Face `AutoModel` contrastive loop instead of `SentenceTransformer.fit(TripletLoss)`. Query, positive, and negative texts are encoded in separate forwards to reduce peak GPU memory. The saved output is still converted to a SentenceTransformer-compatible directory for dense indexing. The training stage supports memory guards:
 
 ```text
 --bge_train_batch_size 4
@@ -179,3 +181,5 @@ outputs/<dataset>/eval/bge_rerank_threshold.json
 ```
 
 The BGE rerank threshold is tuned on `val` with `rerank_score`, then applied to `test` for precision/recall/F2. The rerank metrics include deltas against `hybrid_router` when the baseline metrics are available. `evaluate` prefers the split-specific cache when it exists, then falls back to the aggregate cache for older runs.
+
+`evaluate` builds `eval/summary.json` from the detailed per-method metrics files when they exist, so threshold metrics in the summary match files like `hybrid_router_val_metrics.json` and `bge_rerank_test_metrics.json`.

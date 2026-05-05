@@ -9,14 +9,25 @@ from src.utils.artifact import eval_dir, is_complete, mark_done, read_json, read
 from src.utils.logging import saved, skip
 
 
-def _minmax(values: list[float]) -> list[float]:
-    if not values:
-        return []
-    lo = min(values)
-    hi = max(values)
-    if abs(hi - lo) < 1e-12:
-        return [0.0 for _ in values]
-    return [(value - lo) / (hi - lo) for value in values]
+def _clamp01(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(1.0, max(0.0, number))
+
+
+def _normalized_score(item: dict[str, Any], canonical: str, alias: str, raw_field: str) -> float:
+    if canonical in item:
+        return _clamp01(item.get(canonical))
+    if alias in item:
+        return _clamp01(item.get(alias))
+    if raw_field in item:
+        raise ValueError(
+            f"Hybrid cache row has raw {raw_field} but missing {canonical}. "
+            "Re-run retrieve_cache with --force true to rebuild normalized merged scores."
+        )
+    return 0.0
 
 
 def apply_hybrid(rows: list[dict[str, Any]], alpha_by_qid: dict[str, float] | None = None, fixed_alpha: float = 0.5) -> list[dict[str, Any]]:
@@ -26,10 +37,12 @@ def apply_hybrid(rows: list[dict[str, Any]], alpha_by_qid: dict[str, float] | No
 
     output = []
     for qid, items in grouped.items():
-        bm25_norm = _minmax([float(item.get("bm25_score", 0.0)) for item in items])
-        bge_norm = _minmax([float(item.get("bge_score", 0.0)) for item in items])
-        alpha = alpha_by_qid.get(qid, fixed_alpha) if alpha_by_qid else fixed_alpha
-        for item, bm25_score, bge_score in zip(items, bm25_norm, bge_norm):
+        alpha = _clamp01(alpha_by_qid.get(qid, fixed_alpha) if alpha_by_qid else fixed_alpha)
+        for item in items:
+            bm25_score = _normalized_score(item, "bm25_score_norm", "bm25_norm", "bm25_score")
+            bge_score = _normalized_score(item, "bge_score_norm", "bge_norm", "bge_score")
+            item["bm25_score_norm"] = bm25_score
+            item["bge_score_norm"] = bge_score
             item["bm25_norm"] = bm25_score
             item["bge_norm"] = bge_score
             item["hybrid_alpha"] = alpha

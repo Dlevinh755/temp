@@ -8,9 +8,20 @@ from src.utils.artifact import is_complete, mark_done, read_table, retrieval_dir
 from src.utils.logging import saved, skip
 
 
+QWEN_RERANK_SCHEMA_VERSION = 2
+QWEN_RERANK_SOURCE = "bge_rerank"
+
+
 def rerank_qwen(config: Any) -> None:
     path = retrieval_dir(config) / "qwen_rerank_scores.parquet"
-    if is_complete(path, expected={"model": config.qwen_model, "params": {"candidate_top_k": config.candidate_top_k}}) and not config.force:
+    expected_params = {
+        "schema_version": QWEN_RERANK_SCHEMA_VERSION,
+        "candidate_top_k": config.candidate_top_k,
+        "candidate_unit": "chunk",
+        "ranking_unit": "aid",
+        "source": QWEN_RERANK_SOURCE,
+    }
+    if is_complete(path, expected={"model": config.qwen_model, "params": expected_params}) and not config.force:
         skip(path)
         return
 
@@ -22,7 +33,8 @@ def rerank_qwen(config: Any) -> None:
     for row in rows:
         item = dict(row)
         item["qwen_rerank_score"] = _score(questions[str(item["qid"])], item.get("chunk_text", ""))
+        item["candidate_unit"] = "chunk"
         ranked.append(item)
     fmt = write_table(path, ranked)
-    mark_done(path, config=config, stage="rerank_qwen", input_hash=stable_hash({"rows": len(ranked)}), model=config.qwen_model, params={"candidate_top_k": config.candidate_top_k}, fmt=fmt)
+    mark_done(path, config=config, stage="rerank_qwen", input_hash=stable_hash({"rows": len(ranked), "source": str(source)}), model=config.qwen_model, params=expected_params, fmt=fmt)
     saved(path)

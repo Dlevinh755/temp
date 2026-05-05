@@ -58,6 +58,49 @@ def _chunk_text_by_id(config: Any) -> dict[str, str]:
     return {str(row["chunk_id"]): str(row["text"]) for row in chunks}
 
 
+def _assert_pair_ground_truth(pair_rows: list[dict[str, Any]], chunk_to_aid: dict[str, str], *, name: str) -> None:
+    errors = []
+    for row in pair_rows:
+        qid = str(row["qid"])
+        positive_aid = str(row["positive_aid"])
+        for chunk_id in row.get("positive_chunk_ids", []):
+            mapped_aid = str(chunk_to_aid.get(str(chunk_id), ""))
+            if mapped_aid != positive_aid:
+                errors.append(f"qid={qid} positive_aid={positive_aid} chunk_id={chunk_id} maps_to={mapped_aid}")
+        for aid, chunk_id in zip(row.get("negative_aids", []), row.get("negative_chunk_ids", [])):
+            mapped_aid = str(chunk_to_aid.get(str(chunk_id), ""))
+            if mapped_aid != str(aid):
+                errors.append(f"qid={qid} negative_aid={aid} chunk_id={chunk_id} maps_to={mapped_aid}")
+            if str(aid) == positive_aid:
+                errors.append(f"qid={qid} negative_aid equals positive_aid={positive_aid}")
+    if errors:
+        raise AssertionError(f"{name} has ground-truth/chunk mapping errors: " + "; ".join(errors[:10]))
+
+
+def _assert_ready_ground_truth(ready_rows: list[dict[str, Any]], chunk_to_aid: dict[str, str], *, name: str) -> None:
+    errors = []
+    for row in ready_rows:
+        positive_aid = str(row["positive_aid"])
+        if "pos" in row:
+            for passage in row.get("pos", []):
+                mapped_aid = str(chunk_to_aid.get(str(passage["chunk_id"]), ""))
+                if mapped_aid != positive_aid:
+                    errors.append(f"qid={row['qid']} positive_aid={positive_aid} chunk_id={passage['chunk_id']} maps_to={mapped_aid}")
+            for passage in row.get("neg", []):
+                mapped_aid = str(chunk_to_aid.get(str(passage["chunk_id"]), ""))
+                if mapped_aid != str(passage["aid"]) or str(passage["aid"]) == positive_aid:
+                    errors.append(f"qid={row['qid']} negative_aid={passage['aid']} chunk_id={passage['chunk_id']} maps_to={mapped_aid} positive_aid={positive_aid}")
+        for passage in row.get("passages", []):
+            mapped_aid = str(chunk_to_aid.get(str(passage["chunk_id"]), ""))
+            expected_label = 1 if str(passage["aid"]) == positive_aid else 0
+            if mapped_aid != str(passage["aid"]):
+                errors.append(f"qid={row['qid']} aid={passage['aid']} chunk_id={passage['chunk_id']} maps_to={mapped_aid}")
+            if int(passage["label"]) != expected_label:
+                errors.append(f"qid={row['qid']} aid={passage['aid']} label={passage['label']} expected={expected_label}")
+    if errors:
+        raise AssertionError(f"{name} has ground-truth label errors: " + "; ".join(errors[:10]))
+
+
 def _build_ready_rows(pair_rows: list[dict[str, Any]], chunk_text: dict[str, str], kind: str) -> list[dict[str, Any]]:
     ready_rows = []
     for row in pair_rows:
@@ -191,6 +234,7 @@ def sample_negatives(config: Any) -> None:
         )
 
     chunk_text = _chunk_text_by_id(config)
+    chunk_to_aid = {str(chunk_id): str(aid) for chunk_id, aid in read_json(prepared_dir(config) / "chunk_to_aid.json").items()}
     rng = random.Random(config.seed)
 
     for filename, policy in POLICIES.items():
@@ -214,9 +258,11 @@ def sample_negatives(config: Any) -> None:
                         "negative_chunk_ids": [row["chunk_id"] for row in negatives],
                     }
                 )
+        _assert_pair_ground_truth(rows, chunk_to_aid, name=filename)
         write_jsonl(path, rows)
         kind = "bge" if filename.startswith("bge") else "rerank"
         ready_rows = _build_ready_rows(rows, chunk_text, kind)
+        _assert_ready_ground_truth(ready_rows, chunk_to_aid, name=ready_path.name)
         write_jsonl(ready_path, ready_rows)
         mark_done(path, config=config, stage="sample_negatives", input_hash=stable_hash({"file": filename, "rows": len(rows)}), params=expected_params, fmt="jsonl")
         mark_done(ready_path, config=config, stage="sample_negatives", input_hash=stable_hash({"file": ready_path.name, "rows": len(ready_rows)}), params=expected_params, fmt="jsonl")

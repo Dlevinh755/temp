@@ -15,7 +15,7 @@ from src.utils.logging import saved, skip
 
 
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
-ROUTER_SCHEMA_VERSION = 2
+ROUTER_SCHEMA_VERSION = 3
 ROUTER_LABEL_K = 8.0
 
 
@@ -97,6 +97,7 @@ def _make_alpha_labels(router_rows: list[dict[str, Any]], router_questions: list
         ndcg10_bge = _ndcg_at_10_for_qid(bge_ranked, question)
         dense_perf = 0.7 * r10_bge + 0.3 * ndcg10_bge
         sparse_perf = 0.7 * r10_bm25 + 0.3 * ndcg10_bm25
+        alpha_soft = _sigmoid(ROUTER_LABEL_K * (dense_perf - sparse_perf))
         labels.append(
             {
                 "qid": qid,
@@ -107,7 +108,9 @@ def _make_alpha_labels(router_rows: list[dict[str, Any]], router_questions: list
                 "ndcg10_bge": ndcg10_bge,
                 "dense_perf": dense_perf,
                 "sparse_perf": sparse_perf,
-                "alpha_soft": _sigmoid(ROUTER_LABEL_K * (dense_perf - sparse_perf)),
+                "alpha_soft": alpha_soft,
+                "alpha_convention": "alpha_is_weight_bge",
+                "preferred_by_label": "bge" if alpha_soft > 0.5 else "bm25" if alpha_soft < 0.5 else "tie",
             }
         )
     return labels
@@ -171,6 +174,7 @@ def _write_hybrid_metrics(
             "threshold": threshold,
             **threshold_metrics(rows, questions, score_field="hybrid_score", threshold=threshold),
         },
+        "threshold_selection_split": "val",
         "params": params,
         "num_questions": len(questions),
         "num_rows": len(rows),
@@ -179,6 +183,37 @@ def _write_hybrid_metrics(
     write_json(metrics_path, payload)
     mark_done(metrics_path, config=config, stage="train_router", input_hash=input_hash, model=config.router_model, params={**params, "split": split_name, "output": output_name}, fmt="json")
     return payload
+
+
+def _binary_rate(values: list[float], threshold: float = 0.5) -> float:
+    return float(np.mean([value > threshold for value in values])) if values else 0.0
+
+
+def _alpha_diagnostics(labels: list[dict[str, Any]], predictions: np.ndarray) -> dict[str, Any]:
+    y = np.asarray([float(row["alpha_soft"]) for row in labels], dtype=np.float64)
+    clipped = np.clip(predictions, 0.0, 1.0)
+    dense_minus_sparse = np.asarray([float(row["dense_perf"]) - float(row["sparse_perf"]) for row in labels], dtype=np.float64)
+    label_sign = y > 0.5
+    pred_sign = clipped > 0.5
+    convention_ok = bool(np.all((dense_minus_sparse > 0) == label_sign) and np.all((dense_minus_sparse < 0) == (y < 0.5)))
+    correlation = 0.0
+    if len(y) > 1 and float(np.std(clipped)) > 0 and float(np.std(y)) > 0:
+        correlation = float(np.corrcoef(clipped, y)[0, 1])
+    return {
+        "alpha_convention": "alpha_is_weight_bge",
+        "hybrid_formula": "hybrid_score = alpha * bge_score_norm + (1 - alpha) * bm25_score_norm",
+        "label_formula": "sigmoid(k * (dense_perf - sparse_perf))",
+        "label_gt_0.5_means": "BGE preferred",
+        "label_lt_0.5_means": "BM25 preferred",
+        "convention_self_check_passed": convention_ok,
+        "alpha_label_mean": float(np.mean(y)) if len(y) else 0.0,
+        "alpha_pred_mean": float(np.mean(clipped)) if len(clipped) else 0.0,
+        "alpha_label_gt_0.5_rate": _binary_rate([float(value) for value in y]),
+        "alpha_pred_gt_0.5_rate": _binary_rate([float(value) for value in clipped]),
+        "binary_accuracy_alpha_gt_0.5": float(np.mean(pred_sign == label_sign)) if len(y) else 0.0,
+        "alpha_label_pred_correlation": correlation,
+        "num_router_labels": int(len(y)),
+    }
 
 
 def train_router(config: Any) -> None:
@@ -226,10 +261,11 @@ def train_router(config: Any) -> None:
     y = np.asarray([float(row["alpha_soft"]) for row in router_labels], dtype=np.float64)
     weights = _fit_ridge(x, y, reg=1.0)
     train_predictions = x @ weights
-    mse = float(np.mean((train_predictions - y) ** 2))
+    clipped_train_predictions = np.clip(train_predictions, 0.0, 1.0)
+    mse = float(np.mean((clipped_train_predictions - y) ** 2))
     rmse = float(math.sqrt(mse))
-    mae = float(np.mean(np.abs(train_predictions - y)))
-    binary_accuracy = float(np.mean((train_predictions > 0.5) == (y > 0.5)))
+    mae = float(np.mean(np.abs(clipped_train_predictions - y)))
+    alpha_diagnostics = _alpha_diagnostics(router_labels, train_predictions)
 
     alpha_by_split = {
         split_name: _predict_alpha(rows_questions, vectorizer, weights)
@@ -254,6 +290,8 @@ def train_router(config: Any) -> None:
         {
             "model_type": "tfidf_ridge",
             "label_formula": "sigmoid(k * ((0.7*r10_bge + 0.3*ndcg10_bge) - (0.7*r10_bm25 + 0.3*ndcg10_bm25)))",
+            "alpha_convention": "alpha_is_weight_bge",
+            "hybrid_formula": "hybrid_score = alpha * bge_score_norm + (1 - alpha) * bm25_score_norm",
             "label_k": ROUTER_LABEL_K,
             "train_split": "router",
             "fixed_alpha": 0.5,
@@ -299,10 +337,17 @@ def train_router(config: Any) -> None:
     fixed_threshold_value = float(fixed_val_threshold.get("threshold", 0.0))
     router_threshold_value = float(router_val_threshold.get("threshold", 0.0))
     metrics_payload: dict[str, Any] = {
-        "router_train": {"mse": mse, "rmse": rmse, "mae": mae, "binary_accuracy_alpha_gt_0.5": binary_accuracy},
+        "router_train": {
+            "mse": mse,
+            "rmse": rmse,
+            "mae": mae,
+            **alpha_diagnostics,
+        },
         "fixed_alpha": 0.5,
         "router_model": "tfidf_ridge",
         "label_k": ROUTER_LABEL_K,
+        "alpha_convention": "alpha_is_weight_bge",
+        "hybrid_formula": "hybrid_score = alpha * bge_score_norm + (1 - alpha) * bm25_score_norm",
         "splits": {},
     }
     for split_name in ["router", "val", "test"]:

@@ -85,6 +85,91 @@ def _filter_questions(questions: list[dict[str, Any]], qids: set[str]) -> list[d
     return [row for row in questions if str(row["qid"]) in qids]
 
 
+def _assert_max_candidates(rows: list[dict[str, Any]], *, top_k: int, label: str) -> None:
+    counts: dict[str, int] = {}
+    for row in rows:
+        qid = str(row["qid"])
+        counts[qid] = counts.get(qid, 0) + 1
+    overflow = {qid: count for qid, count in counts.items() if count > top_k}
+    if overflow:
+        examples = sorted(overflow.items(), key=lambda item: item[1], reverse=True)[:5]
+        raise AssertionError(f"{label} exceeds top_k={top_k}. Examples: {examples}")
+
+
+def _assert_no_duplicate_chunks(rows: list[dict[str, Any]], *, label: str) -> None:
+    seen_qid_chunk: set[tuple[str, str]] = set()
+    seen_qid_aid_chunk: set[tuple[str, str, str]] = set()
+    duplicate_qid_chunk = 0
+    duplicate_qid_aid_chunk = 0
+    for row in rows:
+        qid = str(row["qid"])
+        aid = str(row["aid"])
+        chunk_id = str(row.get("chunk_id", ""))
+        key_qid_chunk = (qid, chunk_id)
+        key_qid_aid_chunk = (qid, aid, chunk_id)
+        if key_qid_chunk in seen_qid_chunk:
+            duplicate_qid_chunk += 1
+        else:
+            seen_qid_chunk.add(key_qid_chunk)
+        if key_qid_aid_chunk in seen_qid_aid_chunk:
+            duplicate_qid_aid_chunk += 1
+        else:
+            seen_qid_aid_chunk.add(key_qid_aid_chunk)
+    if duplicate_qid_chunk or duplicate_qid_aid_chunk:
+        raise AssertionError(
+            f"{label} has duplicate chunk candidates: "
+            f"duplicated(qid, chunk_id)={duplicate_qid_chunk}, "
+            f"duplicated(qid, aid, chunk_id)={duplicate_qid_aid_chunk}"
+        )
+
+
+def _assert_valid_rerank_inputs(
+    config: Any,
+    rows: list[dict[str, Any]],
+    questions: dict[str, str],
+    *,
+    label: str,
+) -> None:
+    chunk_to_aid = read_json(prepared_dir(config) / "chunk_to_aid.json")
+    missing_query = []
+    empty_query = []
+    empty_chunk_text = []
+    chunk_aid_mismatch = []
+    for row in rows:
+        qid = str(row["qid"])
+        aid = str(row["aid"])
+        chunk_id = str(row.get("chunk_id", ""))
+        if qid not in questions:
+            missing_query.append(qid)
+        elif not str(questions[qid]).strip():
+            empty_query.append(qid)
+        if not str(row.get("chunk_text", "")).strip():
+            empty_chunk_text.append((qid, aid, chunk_id))
+        mapped_aid = str(chunk_to_aid.get(chunk_id, ""))
+        if mapped_aid and mapped_aid != aid:
+            chunk_aid_mismatch.append((qid, aid, chunk_id, mapped_aid))
+    errors = []
+    if missing_query:
+        errors.append(f"missing_query={missing_query[:5]}")
+    if empty_query:
+        errors.append(f"empty_query={empty_query[:5]}")
+    if empty_chunk_text:
+        errors.append(f"empty_chunk_text={empty_chunk_text[:5]}")
+    if chunk_aid_mismatch:
+        errors.append(f"chunk_aid_mismatch={chunk_aid_mismatch[:5]}")
+    if errors:
+        raise AssertionError(f"{label} invalid rerank inputs: " + "; ".join(errors))
+
+
+def _assert_source_subset(source_rows: list[dict[str, Any]], candidate_rows: list[dict[str, Any]], *, top_k: int, split_name: str) -> None:
+    source_top = _limit_candidates(source_rows, top_k, "hybrid_score" if source_rows and "hybrid_score" in source_rows[0] else "bge_score")
+    source_pairs = {(str(row["qid"]), str(row["aid"])) for row in source_top}
+    candidate_pairs = {(str(row["qid"]), str(row["aid"])) for row in candidate_rows}
+    extra = sorted(candidate_pairs - source_pairs)[:5]
+    if extra:
+        raise AssertionError(f"bge_rerank {split_name} candidates are not subset of hybrid_router top{top_k}: {extra}")
+
+
 def _comparison_with_hybrid_router(config: Any, split_name: str, payload: dict[str, Any]) -> dict[str, Any]:
     baseline_path = eval_dir(config) / f"hybrid_router_{split_name}_metrics.json"
     if not baseline_path.exists():
@@ -175,13 +260,18 @@ def rerank_bge(config: Any) -> None:
         "schema_version": RERANK_BGE_SCHEMA_VERSION,
         "candidate_top_k": config.candidate_top_k,
         "candidate_unit": "chunk",
+        "ranking_unit": "aid",
         "source": RERANK_BGE_SOURCE,
         "splits": ["val", "test"],
     }
-    expected = {"model": config.rerank_model, "params": expected_params}
+    expected_aggregate = {"model": config.rerank_model, "params": {**expected_params, "split": "aggregate"}}
+    expected_by_split = {
+        split_name: {"model": config.rerank_model, "params": {**expected_params, "split": split_name}}
+        for split_name in split_paths
+    }
     if (
-        is_complete(path, expected=expected)
-        and all(is_complete(split_path, expected=expected) for split_path in split_paths.values())
+        is_complete(path, expected=expected_aggregate)
+        and all(is_complete(split_path, expected=expected_by_split[split_name]) for split_name, split_path in split_paths.items())
         and all(is_complete(metric_path) for metric_path in metric_paths)
         and not config.force
     ):
@@ -199,6 +289,7 @@ def rerank_bge(config: Any) -> None:
 
     rows = []
     source_paths = []
+    source_rows_by_split: dict[str, list[dict[str, Any]]] = {}
     for split_name, split_qids in eval_qids_by_split.items():
         split_source = retrieval_dir(config) / f"hybrid_router_scores_{split_name}.parquet"
         if split_source.exists():
@@ -217,9 +308,20 @@ def rerank_bge(config: Any) -> None:
                 if str(row["qid"]) in split_qids
             ]
             source_paths.append(str(aggregate_source))
-        rows.extend(row for row in split_rows if str(row["qid"]) in split_qids)
-    rows = _limit_candidates(rows, config.candidate_top_k, "hybrid_score" if rows and "hybrid_score" in rows[0] else "bge_score") if rows else []
+        split_rows = [row for row in split_rows if str(row["qid"]) in split_qids]
+        if not split_rows:
+            raise ValueError(f"No hybrid_router source rows found for split={split_name}.")
+        if "hybrid_score" not in split_rows[0]:
+            raise ValueError(f"Rerank source for split={split_name} is not hybrid_router-like: missing hybrid_score.")
+        source_rows_by_split[split_name] = split_rows
+        rows.extend(_limit_candidates(split_rows, config.candidate_top_k, "hybrid_score"))
     rows = _expand_aid_rows_to_chunks(config, rows)
+    rows = _limit_candidates(rows, config.candidate_top_k, "hybrid_score" if rows and "hybrid_score" in rows[0] else "bge_score") if rows else []
+    _assert_no_duplicate_chunks(rows, label="bge_rerank input rows")
+    _assert_valid_rerank_inputs(config, rows, questions, label="bge_rerank input rows")
+    for split_name, split_qids in eval_qids_by_split.items():
+        split_candidate_rows = [row for row in rows if str(row["qid"]) in split_qids]
+        _assert_source_subset(source_rows_by_split[split_name], split_candidate_rows, top_k=config.candidate_top_k, split_name=split_name)
     pairs = [(questions[str(row["qid"])], row.get("chunk_text", "")) for row in rows]
     scores = _cross_encoder_scores(config, pairs)
     if scores is None:
@@ -230,19 +332,24 @@ def rerank_bge(config: Any) -> None:
         item["rerank_score"] = score
         ranked.append(item)
     ranked = _limit_candidates(ranked, len(ranked), "rerank_score")
+    ranked = _limit_candidates(ranked, config.candidate_top_k, "rerank_score")
+    _assert_max_candidates(ranked, top_k=config.candidate_top_k, label="bge_rerank ranked rows")
+    _assert_no_duplicate_chunks(ranked, label="bge_rerank ranked rows")
 
     input_hash = stable_hash({"source": sorted(set(source_paths)), "rows": len(ranked), "split_qids": {key: sorted(value) for key, value in eval_qids_by_split.items()}})
     split_rows_by_name: dict[str, list[dict[str, Any]]] = {}
     for split_name, split_path in split_paths.items():
         split_qids = eval_qids_by_split[split_name]
         split_rows = [row for row in ranked if str(row["qid"]) in split_qids]
+        _assert_max_candidates(split_rows, top_k=config.candidate_top_k, label=f"bge_rerank {split_name} rows")
+        _assert_no_duplicate_chunks(split_rows, label=f"bge_rerank {split_name} rows")
         split_rows_by_name[split_name] = split_rows
         split_fmt = write_table(split_path, split_rows)
-        mark_done(split_path, config=config, stage="rerank_bge", input_hash=input_hash, model=config.rerank_model, params=expected_params, fmt=split_fmt)
+        mark_done(split_path, config=config, stage="rerank_bge", input_hash=input_hash, model=config.rerank_model, params={**expected_params, "split": split_name}, fmt=split_fmt)
         saved(split_path)
 
     fmt = write_table(path, ranked)
-    mark_done(path, config=config, stage="rerank_bge", input_hash=input_hash, model=config.rerank_model, params=expected_params, fmt=fmt)
+    mark_done(path, config=config, stage="rerank_bge", input_hash=input_hash, model=config.rerank_model, params={**expected_params, "split": "aggregate"}, fmt=fmt)
     split_questions = {
         split_name: _filter_questions(all_questions, qids)
         for split_name, qids in eval_qids_by_split.items()

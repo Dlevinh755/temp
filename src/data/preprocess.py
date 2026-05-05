@@ -12,6 +12,14 @@ def prepare_data(config: Any) -> None:
     out_dir = prepared_dir(config)
     articles_path = out_dir / "articles.parquet"
     chunks_path = out_dir / "chunks.parquet"
+    input_hash = file_hash(config.corpus_path)
+    expected = {
+        "input_hash": input_hash,
+        "params": {
+            "max_chunk_tokens": config.max_chunk_tokens,
+            "chunk_overlap_sentences": config.chunk_overlap_sentences,
+        },
+    }
     mapping_paths = [
         out_dir / "aid2text.json",
         out_dir / "chunk2aid.json",
@@ -20,9 +28,9 @@ def prepare_data(config: Any) -> None:
         out_dir / "chunk_to_aid.json",
     ]
     if (
-        is_complete(articles_path)
-        and is_complete(chunks_path)
-        and all(is_complete(path) for path in mapping_paths)
+        is_complete(articles_path, expected=expected)
+        and is_complete(chunks_path, expected=expected)
+        and all(is_complete(path, expected=expected) for path in mapping_paths)
         and not config.force
     ):
         skip(out_dir)
@@ -73,7 +81,6 @@ def prepare_data(config: Any) -> None:
             f"Examples: {', '.join(oversize_examples)}"
         )
 
-    input_hash = file_hash(config.corpus_path)
     articles_fmt = write_table(articles_path, articles)
     chunks_fmt = write_table(chunks_path, chunks)
     mappings = {
@@ -94,6 +101,6 @@ def prepare_data(config: Any) -> None:
             params={"max_chunk_tokens": config.max_chunk_tokens, "chunk_overlap_sentences": config.chunk_overlap_sentences},
             fmt="json",
         )
-    mark_done(articles_path, config=config, stage="prepare_data", input_hash=input_hash, fmt=articles_fmt)
-    mark_done(chunks_path, config=config, stage="prepare_data", input_hash=input_hash, fmt=chunks_fmt)
+    mark_done(articles_path, config=config, stage="prepare_data", input_hash=input_hash, params=expected["params"], fmt=articles_fmt)
+    mark_done(chunks_path, config=config, stage="prepare_data", input_hash=input_hash, params=expected["params"], fmt=chunks_fmt)
     saved(out_dir)

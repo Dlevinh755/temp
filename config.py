@@ -92,6 +92,8 @@ class Config:
     test_ratio: float
     max_chunk_tokens: int
     chunk_overlap_sentences: int
+    max_chunks: int
+    max_chunks_per_article: int
 
     corpus_law_id_field: str
     corpus_articles_field: str
@@ -160,6 +162,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test_ratio", type=float, default=0.10)
     parser.add_argument("--max_chunk_tokens", type=int, default=450)
     parser.add_argument("--chunk_overlap_sentences", type=int, default=1)
+    parser.add_argument("--max_chunks", type=int, default=0, help="If >0, fail prepare_data when total chunks exceeds this value.")
+    parser.add_argument("--max_chunks_per_article", type=int, default=0, help="If >0, keep only this many chunks per article.")
 
     parser.add_argument("--corpus_law_id_field", default="law_id")
     parser.add_argument("--corpus_articles_field", default="content")
