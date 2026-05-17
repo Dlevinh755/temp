@@ -10,8 +10,8 @@ from src.utils.logging import saved, skip
 
 POLICIES = {
     "bge_train_pairs.jsonl": [(20, 40, 4), (40, 60, 4)],
-    "rerank_train_pairs.jsonl": [(4, 10, 5), (10, 20, 7), (20, 30, 4)],
-    "qwen_train_pairs.jsonl":   [(4, 10, 5), (10, 20, 7), (20, 30, 4)],
+    "rerank_train_pairs.jsonl": [(4, 10, 5), (10, 20, 9), (20, 5, 2)],
+    "qwen_train_pairs.jsonl":   [(4, 10, 5), (10, 20, 9), (20, 25, 2)],
 }
 
 READY_FILES = {

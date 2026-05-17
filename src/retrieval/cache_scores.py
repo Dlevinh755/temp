@@ -53,6 +53,34 @@ def _merge_scores(bm25_rows: list[dict[str, Any]], bge_rows: list[dict[str, Any]
     return rows
 
 
+def _merge_scores_keep_chunks(bm25_rows: list[dict[str, Any]], bge_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    bm25_map = {(r["qid"], r["aid"]): r for r in bm25_rows}
+    rows: list[dict[str, Any]] = []
+    for r in bge_rows:
+        key = (r["qid"], r["aid"])
+        merged = {
+            "qid": r["qid"],
+            "aid": r["aid"],
+            "chunk_id": r.get("chunk_id"),
+            "bge_score": r.get("bge_score", 0.0),
+            "bge_score_norm": r.get("bge_score_norm", 0.0),
+            "bge_rank": r.get("rank"),
+            "question": r.get("question", ""),
+            "relevant_laws": r.get("relevant_laws", []),
+            "label": int(r.get("label", 0)),
+        }
+        bm25 = bm25_map.get(key)
+        if bm25:
+            merged.update({
+                "bm25_score": bm25.get("bm25_score", 0.0),
+                "bm25_score_norm": bm25.get("bm25_score_norm", 0.0),
+                "bm25_rank": bm25.get("rank"),
+            })
+            merged["label"] = max(merged["label"], int(bm25.get("label", 0)))
+        rows.append(merged)
+    return rows
+
+
 def _filter_questions(questions: list[dict[str, Any]], qids: set[str]) -> list[dict[str, Any]]:
     return [row for row in questions if row["qid"] in qids]
 
@@ -170,10 +198,18 @@ def retrieve_cache(config: Any) -> None:
             raise ValueError(f"No BGE dense search results found for {split_name}. Check dense index and model.")
 
         merged = _merge_scores(bm25_rows, bge_rows)
+        merged_chunks = _merge_scores_keep_chunks(bm25_rows, bge_rows)
         bge_split_rows[split_name] = bge_rows
         all_bm25_rows.extend(bm25_rows)
         all_bge_rows.extend(bge_rows)
         all_merged_rows.extend(merged)
+        # also keep chunk-level merged rows
+        if merged_chunks:
+            all_merged_chunks = globals().get("__all_merged_chunks", None)
+            if all_merged_chunks is None:
+                globals()["__all_merged_chunks"] = []
+                all_merged_chunks = globals()["__all_merged_chunks"]
+            all_merged_chunks.extend(merged_chunks)
         input_counts[split_name] = {"bm25": len(bm25_rows), "bge": len(bge_rows), "merged": len(merged)}
 
         bm25_path = out_dir / f"bm25_scores_{split_name}.parquet"
@@ -182,19 +218,30 @@ def retrieve_cache(config: Any) -> None:
         bm25_fmt = write_table(bm25_path, bm25_rows)
         bge_fmt = write_table(bge_path, bge_rows)
         merged_fmt = write_table(merged_split_path, merged)
+        # write chunk-level merged split as well
+        merged_chunks_split_path = out_dir / f"merged_chunks_{split_name}.parquet"
+        merged_chunks_fmt = write_table(merged_chunks_split_path, merged_chunks)
         split_input_hash = stable_hash({"split": split_name, **input_counts[split_name]})
         mark_done(bm25_path, config=config, stage="retrieve_cache", input_hash=split_input_hash, params={**params, "split": split_name}, fmt=bm25_fmt)
         mark_done(bge_path, config=config, stage="retrieve_cache", input_hash=split_input_hash, model=dense_model, params={**params, "split": split_name}, fmt=bge_fmt)
         mark_done(merged_split_path, config=config, stage="retrieve_cache", input_hash=split_input_hash, model=dense_model, params={**params, "split": split_name}, fmt=merged_fmt)
+        mark_done(merged_chunks_split_path, config=config, stage="retrieve_cache", input_hash=split_input_hash, model=dense_model, params={**params, "split": split_name}, fmt=merged_chunks_fmt)
 
     print(f"[retrieve_cache] split counts: {input_counts}")
 
     bm25_fmt = write_table(out_dir / "bm25_scores.parquet", all_bm25_rows)
     bge_fmt = write_table(out_dir / "bge_scores.parquet", all_bge_rows)
     merged_fmt = write_table(merged_path, all_merged_rows)
+    # write aggregate chunk-level merged if built
+    all_merged_chunks = globals().get("__all_merged_chunks", [])
+    if all_merged_chunks:
+        merged_chunks_path = out_dir / "merged_chunks.parquet"
+        merged_chunks_fmt = write_table(merged_chunks_path, all_merged_chunks)
     input_hash = stable_hash(input_counts)
     mark_done(out_dir / "bm25_scores.parquet", config=config, stage="retrieve_cache", input_hash=input_hash, params=params, fmt=bm25_fmt)
     mark_done(out_dir / "bge_scores.parquet", config=config, stage="retrieve_cache", input_hash=input_hash, model=dense_model, params=params, fmt=bge_fmt)
     mark_done(merged_path, config=config, stage="retrieve_cache", input_hash=input_hash, model=dense_model, params=params, fmt=merged_fmt)
+    if all_merged_chunks:
+        mark_done(out_dir / "merged_chunks.parquet", config=config, stage="retrieve_cache", input_hash=input_hash, model=dense_model, params=params, fmt=merged_chunks_fmt)
     _write_bge_metrics(config, bge_split_rows, split_questions, dense_model=dense_model, params=params, input_hash=input_hash, pool_stats=bge_pool_stats)
     saved(out_dir)

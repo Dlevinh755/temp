@@ -356,7 +356,6 @@ def rerank_bge(config: Any) -> None:
         source_rows_by_split[split_name] = split_rows
         rows.extend(_limit_candidates(split_rows, config.candidate_top_k, "hybrid_score"))
     rows = _expand_aid_rows_to_chunks(config, rows)
-    rows = _limit_candidates(rows, config.candidate_top_k, "hybrid_score" if rows and "hybrid_score" in rows[0] else "bge_score") if rows else []
     _assert_no_duplicate_chunks(rows, label="bge_rerank input rows")
     _assert_valid_rerank_inputs(config, rows, questions, label="bge_rerank input rows")
     for split_name, split_qids in eval_qids_by_split.items():

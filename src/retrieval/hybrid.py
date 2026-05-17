@@ -96,7 +96,9 @@ def tune_hybrid(config: Any) -> None:
         skip(out_path)
         return
 
-    rows = read_table(retrieval_dir(config) / "merged_scores.parquet")
+    chunks_path = retrieval_dir(config) / "merged_chunks.parquet"
+    merged_path = retrieval_dir(config) / "merged_scores.parquet"
+    rows = read_table(chunks_path) if chunks_path.exists() else read_table(merged_path)
     splits = read_json(config.dataset_dir / "prepared" / "splits.json")
     questions = load_questions(config)
     val_questions = _filter_questions(questions, set(splits["val"]))

@@ -276,10 +276,14 @@ def train_router(config: Any) -> None:
     if not split_questions["router"]:
         raise ValueError("Router split is empty. Cannot train router alpha regressor.")
 
-    split_rows = {
-        split_name: read_table(retrieval_dir(config) / f"merged_scores_{split_name}.parquet")
-        for split_name in ["router", "val", "test"]
-    }
+    split_rows = {}
+    for split_name in ["router", "val", "test"]:
+        chunk_path = retrieval_dir(config) / f"merged_chunks_{split_name}.parquet"
+        merged_path = retrieval_dir(config) / f"merged_scores_{split_name}.parquet"
+        if chunk_path.exists():
+            split_rows[split_name] = read_table(chunk_path)
+        else:
+            split_rows[split_name] = read_table(merged_path)
     router_labels = _make_alpha_labels(split_rows["router"], split_questions["router"])
     if not router_labels:
         raise ValueError("No router alpha labels were created.")
