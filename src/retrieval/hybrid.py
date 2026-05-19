@@ -9,14 +9,55 @@ from src.utils.artifact import eval_dir, is_complete, mark_done, read_json, read
 from src.utils.logging import saved, skip
 
 
-def _minmax(values: list[float]) -> list[float]:
+def _clamp01(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(1.0, max(0.0, number))
+
+
+def _percentile(values: list[float], percentile: float) -> float:
     if not values:
-        return []
-    lo = min(values)
-    hi = max(values)
-    if abs(hi - lo) < 1e-12:
-        return [0.0 for _ in values]
-    return [(value - lo) / (hi - lo) for value in values]
+        return 0.0
+    sorted_values = sorted(_clamp01(value) for value in values)
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    position = (len(sorted_values) - 1) * max(0.0, min(100.0, percentile)) / 100.0
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(sorted_values) - 1)
+    fraction = position - lower_index
+    lower_value = sorted_values[lower_index]
+    upper_value = sorted_values[upper_index]
+    return lower_value * (1.0 - fraction) + upper_value * fraction
+
+
+def _observed_scores(items: list[dict[str, Any]], canonical: str, alias: str, raw_field: str) -> list[float]:
+    scores: list[float] = []
+    for item in items:
+        if canonical in item:
+            scores.append(_clamp01(item.get(canonical)))
+        elif alias in item:
+            scores.append(_clamp01(item.get(alias)))
+        elif raw_field in item:
+            raise ValueError(
+                f"Hybrid cache row has raw {raw_field} but missing {canonical}. "
+                "Re-run retrieve_cache with --force true to rebuild normalized merged scores."
+            )
+    return scores
+
+
+def _normalized_score(item: dict[str, Any], canonical: str, alias: str, raw_field: str, fallback: float) -> float:
+    if canonical in item:
+        return _clamp01(item.get(canonical))
+    if alias in item:
+        return _clamp01(item.get(alias))
+    if raw_field in item:
+        raise ValueError(
+            f"Hybrid cache row has raw {raw_field} but missing {canonical}. "
+            "Re-run retrieve_cache with --force true to rebuild normalized merged scores."
+        )
+    return 0.0
 
 
 def apply_hybrid(rows: list[dict[str, Any]], alpha_by_qid: dict[str, float] | None = None, fixed_alpha: float = 0.5) -> list[dict[str, Any]]:
@@ -26,10 +67,14 @@ def apply_hybrid(rows: list[dict[str, Any]], alpha_by_qid: dict[str, float] | No
 
     output = []
     for qid, items in grouped.items():
-        bm25_norm = _minmax([float(item.get("bm25_score", 0.0)) for item in items])
-        bge_norm = _minmax([float(item.get("bge_score", 0.0)) for item in items])
-        alpha = alpha_by_qid.get(qid, fixed_alpha) if alpha_by_qid else fixed_alpha
-        for item, bm25_score, bge_score in zip(items, bm25_norm, bge_norm):
+        alpha = _clamp01(alpha_by_qid.get(qid, fixed_alpha) if alpha_by_qid else fixed_alpha)
+        bm25_fallback = _percentile(_observed_scores(items, "bm25_score_norm", "bm25_norm", "bm25_score"), 10.0)
+        bge_fallback = _percentile(_observed_scores(items, "bge_score_norm", "bge_norm", "bge_score"), 10.0)
+        for item in items:
+            bm25_score = _normalized_score(item, "bm25_score_norm", "bm25_norm", "bm25_score", bm25_fallback)
+            bge_score = _normalized_score(item, "bge_score_norm", "bge_norm", "bge_score", bge_fallback)
+            item["bm25_score_norm"] = bm25_score
+            item["bge_score_norm"] = bge_score
             item["bm25_norm"] = bm25_score
             item["bge_norm"] = bge_score
             item["hybrid_alpha"] = alpha

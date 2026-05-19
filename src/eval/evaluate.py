@@ -3,21 +3,63 @@ from __future__ import annotations
 from typing import Any
 
 from src.data.loaders import load_questions
-from src.eval.metrics import ranking_metrics, threshold_metrics
+from src.eval.metrics import ranking_metrics, threshold_metrics, topk_metrics
 from src.retrieval.hybrid import apply_hybrid
 from src.utils.artifact import eval_dir, is_complete, mark_done, read_json, read_table, retrieval_dir, stable_hash, write_json
 from src.utils.logging import saved, skip
 
 
 EVAL_SOURCES = {
-    "bm25": ("merged_scores.parquet", "bm25_score"),
-    "bge": ("merged_scores.parquet", "bge_score"),
+    "bm25": ("bm25_scores.parquet", "bm25_score_norm"),
+    "bge": ("bge_scores.parquet", "bge_score_norm"),
     "hybrid_fixed": ("hybrid_fixed_scores.parquet", "hybrid_score"),
     "hybrid_tuned": ("hybrid_tuned_scores.parquet", "hybrid_score"),
     "hybrid_router": ("hybrid_router_scores.parquet", "hybrid_score"),
     "rerank_bge": ("bge_rerank_scores.parquet", "rerank_score"),
+    "rerank_llm": ("llm_rerank_scores.parquet", "llm_rerank_score"),
     "rerank_qwen": ("qwen_rerank_scores.parquet", "qwen_rerank_score"),
 }
+
+DETAIL_METRIC_FILES = {
+    "bm25": "bm25_{split}_metrics.json",
+    "bge": "bge_{split}_metrics.json",
+    "hybrid_fixed": "hybrid_fixed_{split}_metrics.json",
+    "hybrid_router": "hybrid_router_{split}_metrics.json",
+    "rerank_bge": "bge_rerank_{split}_metrics.json",
+    "rerank_llm": "llm_rerank_{split}_metrics.json",
+}
+VAL_TUNED_SOURCES = set(DETAIL_METRIC_FILES)
+
+
+def _assert_close(name: str, left: Any, right: Any, *, tol: float = 1e-12) -> None:
+    if abs(float(left) - float(right)) > tol:
+        raise AssertionError(f"{name} mismatch: {left} != {right}")
+
+
+def _source_signature(config: Any) -> dict[str, Any]:
+    signature: dict[str, Any] = {}
+    for source, (filename, score_field) in EVAL_SOURCES.items():
+        paths = [retrieval_dir(config) / filename]
+        stem, suffix = filename.rsplit(".", 1)
+        paths.extend(retrieval_dir(config) / f"{stem}_{split_name}.{suffix}" for split_name in ["val", "test"])
+        for path in paths:
+            if path.exists():
+                stat = path.stat()
+                signature[str(path.name)] = {
+                    "source": source,
+                    "score_field": score_field,
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+    return signature
+
+
+def _source_path_for_split(config: Any, filename: str, split_name: str) -> Any:
+    stem, suffix = filename.rsplit(".", 1)
+    split_path = retrieval_dir(config) / f"{stem}_{split_name}.{suffix}"
+    if split_path.exists():
+        return split_path
+    return retrieval_dir(config) / filename
 
 
 def _filter_questions(questions: list[dict[str, Any]], qids: set[str]) -> list[dict[str, Any]]:
@@ -34,9 +76,104 @@ def _rank(rows: list[dict[str, Any]], score_field: str) -> list[dict[str, Any]]:
     return output
 
 
+def _flatten_detail_metrics(payload: dict[str, Any]) -> dict[str, Any]:
+    ranking = payload.get("ranking", {})
+    threshold = payload.get("threshold", {})
+    topk_fixed_3 = payload.get("topk_fixed_3", {})
+    topk_tuned = payload.get("topk_tuned", {})
+    if not threshold:
+        raise ValueError(f"Detailed metrics for split={payload.get('split')} are missing threshold payload.")
+    output = {**ranking}
+    for key in ["threshold", "precision", "recall", "f2"]:
+        if key in threshold:
+            output[key] = threshold[key]
+    for key in ["precision", "recall", "f2"]:
+        if key in output and key in threshold:
+            _assert_close(f"detail_metrics.{key}", output[key], threshold[key])
+    if topk_fixed_3:
+        output["topk_fixed_3"] = topk_fixed_3
+        output["precision@3"] = topk_fixed_3.get("precision@3", topk_fixed_3.get("precision"))
+        output["recall@3_micro"] = topk_fixed_3.get("recall@3", topk_fixed_3.get("recall"))
+        output["f2@3"] = topk_fixed_3.get("f2@3", topk_fixed_3.get("f2"))
+    if topk_tuned:
+        output["topk_tuned"] = topk_tuned
+        output["best_top_k"] = topk_tuned.get("top_k")
+        output["topk_precision"] = topk_tuned.get("precision")
+        output["topk_recall"] = topk_tuned.get("recall")
+        output["topk_f2"] = topk_tuned.get("f2")
+        output["topk_source"] = payload.get("topk_selection_split", "val")
+    output["score_field"] = payload.get("score_field")
+    output["threshold_source"] = payload.get("threshold_selection_split", "val")
+    output["metrics_source"] = "detail_metrics"
+    return output
+
+
+def _detail_path_for(config: Any, source: str, split_name: str) -> Any:
+    pattern = DETAIL_METRIC_FILES.get(source)
+    if not pattern:
+        return None
+    return eval_dir(config) / pattern.format(split=split_name)
+
+
+def _detail_metrics_for(config: Any, source: str, split_name: str) -> dict[str, Any] | None:
+    path = _detail_path_for(config, source, split_name)
+    if path is None:
+        return None
+    if not path.exists():
+        return None
+    return _flatten_detail_metrics(read_json(path))
+
+
+def _assert_val_threshold_used(config: Any, source: str, split_name: str, detail_payload: dict[str, Any]) -> None:
+    val_path = _detail_path_for(config, source, "val")
+    if val_path is None or not val_path.exists():
+        raise ValueError(f"Missing val metrics for {source}; cannot verify val-selected threshold.")
+    val_payload = read_json(val_path)
+    val_threshold = float(val_payload["threshold"]["threshold"])
+    split_threshold = float(detail_payload["threshold"]["threshold"])
+    _assert_close(f"{source}_{split_name}.threshold_from_val", split_threshold, val_threshold)
+    selection_split = detail_payload.get("threshold_selection_split", "val")
+    if selection_split != "val":
+        raise AssertionError(f"{source}_{split_name} threshold_selection_split={selection_split!r}, expected 'val'")
+
+
+def _compare_strategies(summary: dict[str, Any]) -> None:
+    """Print comparison between hybrid_tuned (fixed) and hybrid_router (per-query alpha)."""
+    print("\n" + "="*70)
+    print("[HYBRID ROUTER EVALUATION] Comparing fixed alpha vs per-query alpha")
+    print("="*70)
+    
+    for split in ["val", "test"]:
+        tuned_key = f"hybrid_tuned_{split}"
+        router_key = f"hybrid_router_{split}"
+        
+        if tuned_key not in summary or router_key not in summary:
+            continue
+        
+        tuned = summary[tuned_key]
+        router = summary[router_key]
+        
+        print(f"\n[{split.upper()} SET]")
+        print(f"{'Metric':<15} {'hybrid_tuned':<15} {'hybrid_router':<15} {'Improvement':<15}")
+        print("-" * 60)
+        
+        for metric in ["hit@10", "recall@10", "ndcg@10"]:
+            tuned_val = tuned.get(metric, 0.0)
+            router_val = router.get(metric, 0.0)
+            if tuned_val > 0:
+                improvement = ((router_val - tuned_val) / tuned_val) * 100
+                print(f"{metric:<15} {tuned_val:<15.4f} {router_val:<15.4f} {improvement:+.2f}%")
+            else:
+                print(f"{metric:<15} {tuned_val:<15.4f} {router_val:<15.4f} N/A")
+    
+    print("="*70 + "\n")
+
+
 def evaluate(config: Any) -> None:
     path = eval_dir(config) / "summary.json"
-    if is_complete(path, expected={"params": {"threshold": config.threshold}}) and not config.force:
+    signature = _source_signature(config)
+    expected_params = {"threshold": config.threshold, "sources": signature}
+    if is_complete(path, expected={"params": expected_params}) and not config.force:
         skip(path)
         return
 
@@ -47,20 +184,41 @@ def evaluate(config: Any) -> None:
     for split_name in ["val", "test"]:
         split_questions = _filter_questions(questions, set(splits[split_name]))
         for source, (filename, score_field) in EVAL_SOURCES.items():
-            source_path = retrieval_dir(config) / filename
+            key = f"{source}_{split_name}"
+            detail_metrics = _detail_metrics_for(config, source, split_name)
+            if detail_metrics is not None:
+                summary[key] = detail_metrics
+                detail_path = eval_dir(config) / DETAIL_METRIC_FILES[source].format(split=split_name)
+                detail_payload = read_json(detail_path)
+                _assert_val_threshold_used(config, source, split_name, detail_payload)
+                for metric_name in ["precision", "recall", "f2"]:
+                    _assert_close(f"{key}.{metric_name}", summary[key][metric_name], detail_payload["threshold"][metric_name])
+                continue
+            source_path = _source_path_for_split(config, filename, split_name)
             if not source_path.exists():
                 continue
+            if source in VAL_TUNED_SOURCES:
+                detail_path = _detail_path_for(config, source, split_name)
+                raise ValueError(
+                    f"{source}_{split_name} has retrieval cache at {source_path} but missing detailed metrics {detail_path}. "
+                    "Run the producing stage with --force true so evaluate uses the val-selected threshold instead of config.threshold."
+                )
             rows = read_table(source_path)
             if source == "hybrid_tuned":
                 alpha = read_json(eval_dir(config) / "hybrid_alpha.json")["best_alpha"]
                 rows = apply_hybrid(read_table(retrieval_dir(config) / "merged_scores.parquet"), fixed_alpha=alpha)
             ranked = _rank(rows, score_field)
-            key = f"{source}_{split_name}"
             summary[key] = {
                 **ranking_metrics(ranked, split_questions),
                 **threshold_metrics(ranked, split_questions, score_field=score_field, threshold=config.threshold),
+                "topk_fixed_3": {"top_k": 3, **topk_metrics(ranked, split_questions, score_field=score_field, k=3)},
+                "threshold": config.threshold,
+                "score_field": score_field,
+                "threshold_source": "config.threshold",
+                "metrics_source": "evaluate_fallback",
             }
 
+    _compare_strategies(summary)
     write_json(path, summary)
-    mark_done(path, config=config, stage="evaluate", input_hash=stable_hash(summary.keys()), params={"threshold": config.threshold}, fmt="json")
+    mark_done(path, config=config, stage="evaluate", input_hash=stable_hash({"summary": sorted(summary.keys()), "sources": signature}), params=expected_params, fmt="json")
     saved(path)

@@ -11,6 +11,8 @@ __pycache__/
 .venv/
 venv/
 env/
+tranining_sumary/
+report/
 
 # Local data and generated artifacts
 outputs/
@@ -26,3 +28,6 @@ raw_data/
 .cache/
 wandb/
 mlruns/
+
+descrep.md
+handoff.md

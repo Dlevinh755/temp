@@ -5,7 +5,7 @@ import re
 from collections import Counter
 from typing import Any
 
-from src.utils.artifact import eval_dir, file_hash, is_complete, mark_done, prepared_dir, read_json, read_table, stable_hash, write_pickle
+from src.utils.artifact import eval_dir, file_hash, is_complete, mark_done, prepared_dir, read_json, read_table, stable_hash, write_json, write_pickle
 from src.utils.logging import saved, skip
 
 
@@ -71,12 +71,20 @@ def resolve_bm25_params(config: Any) -> tuple[float, float]:
 
 def build_bm25(config: Any) -> None:
     path = bm25_index_path(config)
-    if is_complete(path) and not config.force:
+    params_path = path.with_name("bm25_params.json")
+    if is_complete(path) and is_complete(params_path) and not config.force:
         skip(path)
         return
 
     articles = read_table(prepared_dir(config) / "articles.parquet")
     k1, b = resolve_bm25_params(config)
+    params = {
+        "k1": k1,
+        "b": b,
+        "tokenizer": "regex_lowercase_word",
+        "preprocessing": {"lowercase": True, "token_pattern": TOKEN_RE.pattern},
+        "num_documents": len(articles),
+    }
     index = SimpleBM25(
         [row["aid"] for row in articles],
         [row["text"] for row in articles],
@@ -84,12 +92,15 @@ def build_bm25(config: Any) -> None:
         b=b,
     )
     write_pickle(path, index)
+    write_json(params_path, params)
+    input_hash = stable_hash([row["aid"] for row in articles])
     mark_done(
         path,
         config=config,
         stage="build_bm25",
-        input_hash=stable_hash([row["aid"] for row in articles]),
-        params={"k1": k1, "b": b},
+        input_hash=input_hash,
+        params=params,
         fmt="pickle",
     )
+    mark_done(params_path, config=config, stage="build_bm25", input_hash=input_hash, params=params, fmt="json")
     saved(path)
